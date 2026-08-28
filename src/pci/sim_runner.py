@@ -29,7 +29,7 @@ from pci.pbvs_socket_bias import (
     sample_socket_bias_world,
 )
 from pci.pipeline import InsertPipeline, PipelineConfig, PipelinePhase
-from pci.sensors import read_right_finger_force12, read_wrist_wrench_local
+from pci.sensors import read_right_finger_force12, read_wrist_wrench_local, read_wrist_wrench_world
 from pci.task_frame import TaskFrame
 from pci.ego_video import EgoVideoRecorder
 from pci.wrist import apply_tip_delta44, wrench_in_hole_frame
@@ -262,7 +262,7 @@ def _hold_for_video(
 
 def _right_fz_hole(raw) -> float:
     feat = features_from_raw(raw)
-    wr = read_wrist_wrench_local(raw)
+    wr = read_wrist_wrench_world(raw)
     return float(wrench_in_hole_frame(wr[0], feat.hole_axis)[2])
 
 
@@ -549,16 +549,21 @@ def run_pci_episode(
         else int(cfg.get("sim", {}).get("max_control_steps", 1200))
     )
 
-    align_steps, align_reason, noise_meta = run_pbvs_coarse_align(
+    # Phase A: force-gated biased surface press (not open-loop INSERT).
+    align_steps, align_reason, surface_meta = run_pbvs_biased_surface_press(
         env, hybrid, gym_env, cfg=cfg, ego_recorder=ego_recorder
     )
-    if align_reason != "align_ok":
+    surface_ok = align_reason in (
+        "surface_press",
+        "surface_press_but_bad_geom",
+    )
+    if not surface_ok:
         feat = features_from_raw(raw)
         return {
             "success": False,
             "insert_ok": False,
             "fail_reason": align_reason,
-            "align_phase": "ALIGN",
+            "align_phase": "SURFACE",
             "align_steps": align_steps,
             "control_steps": 0,
             "final_phase": "APPROACH",
@@ -566,18 +571,20 @@ def run_pci_episode(
             "eval_only": True,
             "hybrid_summary": hybrid.episode_summary(),
             "traj_tail": [],
-            "phase_a_mode": "pbvs_coarse_align",
-            "approach_noise": noise_meta,
+            "phase_a_mode": "pbvs_biased_surface_press",
+            "approach_noise": surface_meta,
+            "surface_meta": surface_meta,
         }
 
     action44 = current_action44(raw)
     feat_b = features_from_raw(raw)
+    # One-time privileged tool frame at A→B only (frozen thereafter).
     task_frame = TaskFrame.from_hole_axis(
         action44[0:3],
         feat_b.hole_axis,
         peg_axis_world=feat_b.peg_axis,
     )
-    wrench = read_wrist_wrench_local(raw)
+    wrench = read_wrist_wrench_world(raw)
     finger12 = read_right_finger_force12(raw, force_labeler)
     hold_fingers = action44[6:22].copy()
     pipeline.begin_compliant(
@@ -586,7 +593,7 @@ def run_pci_episode(
         finger12,
         hold_fingers,
         action44[0:3],
-        along_at_b_m=feat_b.along_m,
+        already_on_surface=True,
     )
 
     traj: list[dict[str, Any]] = []
@@ -599,7 +606,7 @@ def run_pci_episode(
         outcome = env._labeler.compute(raw)
         insert_ok = bool(outcome.insert_ok)
         action44 = current_action44(raw)
-        wrench = read_wrist_wrench_local(raw)
+        wrench = read_wrist_wrench_world(raw)
         finger12 = read_right_finger_force12(raw, force_labeler)
         pr = pipeline.step(
             wrench[0],
@@ -648,7 +655,7 @@ def run_pci_episode(
         "success": success,
         "insert_ok": insert_ok,
         "fail_reason": fail_reason,
-        "align_phase": "ALIGN",
+        "align_phase": "SURFACE",
         "align_steps": align_steps,
         "control_steps": control_steps,
         "final_phase": final_phase,
@@ -658,9 +665,11 @@ def run_pci_episode(
         "eval_only": True,
         "hybrid_summary": hybrid.episode_summary(),
         "traj_tail": traj[-5:],
-        "phase_b_sensors": "wrist_ft+fingertip_force+ frozen_tool_frame",
-        "phase_a_mode": "pbvs_coarse_align",
-        "approach_noise": noise_meta,
+        "phase_b_sensors": "wrist_ft_world+fingertip_force+frozen_tool_frame",
+        "phase_a_mode": "pbvs_biased_surface_press",
+        "approach_noise": surface_meta,
+        "surface_meta": surface_meta,
+        "surface_reason": align_reason,
     }
 
 

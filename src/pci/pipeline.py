@@ -82,7 +82,7 @@ class InsertPipeline:
         hold_hand16: np.ndarray,
         wrist_xyz: np.ndarray,
         *,
-        along_at_b_m: float | None = None,
+        already_on_surface: bool = False,
     ) -> None:
         self.phase = PipelinePhase.COMPLIANT_SEARCH
         self._frame = frame
@@ -93,7 +93,7 @@ class InsertPipeline:
             frame,
             wrench_right6,
             wrist_xyz=wrist_xyz,
-            along_at_b_m=along_at_b_m,
+            already_on_surface=already_on_surface,
         )
         self.insert.reset(frame, wrench_right6, wrist_xyz)
         self.fingers.reset(finger_force12)

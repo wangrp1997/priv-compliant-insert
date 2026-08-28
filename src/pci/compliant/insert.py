@@ -190,14 +190,14 @@ class CompliantInsertController:
 
         self._prev_axial = axial_pos
 
-        # Insert: Z soft, XY stiff (ConnTact axis selection).
+        # Insert: Z soft, XY stiff-but-not-zero (small lateral give for edge catch).
         f_des = np.zeros(6, dtype=np.float64)
         f_des[2] = self._push_sign * cfg.f_insert_des_n
         k = np.array(
             [cfg.admittance_k_lateral, cfg.admittance_k_lateral, cfg.admittance_k_axial],
             dtype=np.float64,
         )
-        comply = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        comply = np.array([0.25, 0.25, 1.0], dtype=np.float64)
 
         v_tool = self._v_tool(frame, wrist, dt=dt, prev_delta_xyz=prev_delta_xyz)
         admit = frame.admit_step(

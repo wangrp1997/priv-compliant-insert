@@ -27,6 +27,19 @@ def read_wrist_wrench_local(raw) -> np.ndarray:
     return result.copy()
 
 
+def read_wrist_wrench_world(raw) -> np.ndarray:
+    """Return ``(2, 6)`` wrist wrench in **world** frame (site_xmat @ local)."""
+    local = read_wrist_wrench_local(raw)
+    data = raw._data
+    site_ids = (int(raw._site_right_id), int(raw._site_left_id))
+    out = np.empty_like(local)
+    for side, site_id in enumerate(site_ids):
+        rot = np.asarray(data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+        out[side, :3] = rot @ local[side, :3]
+        out[side, 3:6] = rot @ local[side, 3:6]
+    return out
+
+
 def read_right_finger_force12(raw, labeler) -> np.ndarray:
     """Right-hand fingertip contact forces (12,) from ``FingerForceLabeler``."""
     frame = labeler.compute(raw)

@@ -62,11 +62,11 @@ def main() -> int:
 
     from pci.features import features_from_raw
     from pci.pipeline import PipelinePhase
-    from pci.sensors import read_right_finger_force12, read_wrist_wrench_local
+    from pci.sensors import read_right_finger_force12, read_wrist_wrench_world
     from pci.sim_runner import (
         _sim_dt,
         build_env_and_controllers,
-        run_pbvs_coarse_align,
+        run_pbvs_biased_surface_press,
         step_action44,
     )
     from pci.task_frame import TaskFrame
@@ -83,10 +83,10 @@ def main() -> int:
         gym_env = env._env
         max_ctrl = int(cfg.get("sim", {}).get("max_control_steps", 1200))
 
-        align_steps, align_reason, noise_meta = run_pbvs_coarse_align(
+        align_steps, align_reason, surface_meta = run_pbvs_biased_surface_press(
             env, hybrid, gym_env, cfg=cfg, rng=rng
         )
-        if align_reason != "align_ok":
+        if align_reason not in ("surface_press", "surface_press_but_bad_geom"):
             feat = features_from_raw(raw)
             print(f"[diag] Phase A failed: {align_reason} tip={feat.tip_socket_dist_m*1000:.1f}mm")
             return 1
@@ -98,7 +98,7 @@ def main() -> int:
             feat0.hole_axis,
             peg_axis_world=feat0.peg_axis,
         )
-        wrench = read_wrist_wrench_local(raw)
+        wrench = read_wrist_wrench_world(raw)
         finger12 = read_right_finger_force12(raw, force_labeler)
         hold_fingers = action44[6:22].copy()
         pipeline.begin_compliant(
@@ -107,7 +107,7 @@ def main() -> int:
             finger12,
             hold_fingers,
             action44[0:3],
-            along_at_b_m=feat0.along_m,
+            already_on_surface=True,
         )
         wh0 = task_frame.wrench_tool(wrench[0])
         b_start_feat = feat0
@@ -121,7 +121,7 @@ def main() -> int:
         for step in range(max_ctrl):
             outcome = env._labeler.compute(raw)
             action44 = current_action44(raw)
-            wrench = read_wrist_wrench_local(raw)
+            wrench = read_wrist_wrench_world(raw)
             finger12 = read_right_finger_force12(raw, force_labeler)
             feat = features_from_raw(raw)
             wh = task_frame.wrench_tool(wrench[0])
@@ -173,9 +173,7 @@ def main() -> int:
                     "delta_along_hole_mm": _delta_along_hole(delta, hole_axis) * 1000,
                     "delta_along_tool_mm": _delta_along_tool(delta, task_frame.approach_axis) * 1000,
                     "tip_move_along_hole_mm": _delta_along_hole(tip_move, hole_axis) * 1000,
-                    "near_rim_priv": feat1.along_m <= pipeline.search.config.along_surface_m + 0.004,
-                    "wrist_travel_mm": pipeline.search._wrist_travel_along(task_frame, action44[0:3])
-                    * 1000,
+                    "along_mm_priv_eval": feat1.along_m * 1000,
                     "f_des_z": float(pipeline.search._push_sign * pipeline.search.config.push_force_n)
                     if pr.phase == PipelinePhase.COMPLIANT_SEARCH
                     else float(pipeline.insert._push_sign * pipeline.insert.config.f_insert_des_n),
@@ -195,7 +193,8 @@ def main() -> int:
         out = {
             "episode": args.episode,
             "align_steps": align_steps,
-            "approach_noise": noise_meta,
+            "surface_reason": align_reason,
+            "surface_meta": surface_meta,
             "b_start": {
                 "tip_dist_mm": b_start_feat.tip_socket_dist_m * 1000,
                 "lat_mm": b_start_feat.lateral_m * 1000,
@@ -207,8 +206,7 @@ def main() -> int:
                 "peg_axis_dot_hole": peg_hole_dot,
                 "hole_axis": hole_axis.tolist(),
                 "tool_approach_axis": task_frame.approach_axis.tolist(),
-                "along_surface_target_mm": pipeline.search.config.along_surface_m * 1000,
-                "along_travel_mm": pipeline.search._along_travel_m * 1000,
+                "already_on_surface": True,
             },
             "reason_counts": reasons,
             "traj": traj,

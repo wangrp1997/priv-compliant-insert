@@ -1,4 +1,8 @@
-"""B1: tool-frame spiral search + wrist F/T admittance (ConnTact / PSFT)."""
+"""B1: tool-frame spiral search + wrist F/T admittance (ConnTact / PSFT).
+
+Theory: constant-force surface contact + Archimedean XY spiral; hole = Fz drop.
+No privileged along/rim distance in the control loop.
+"""
 
 from __future__ import annotations
 
@@ -30,11 +34,6 @@ class CompliantSearchConfig:
     contact_min_seek_steps: int = 5
     contact_rise_n: float = 1.5
     contact_seek_max_steps: int = 150
-    along_surface_m: float = 0.002
-    wrist_along_scale: float = 0.55
-    rim_travel_frac: float = 0.92
-    seek_axial_step_m: float = 0.0009
-    spiral_axial_slop_m: float = 0.0006
     hole_detect_fz_drop_n: float = 1.2
     hole_f_max_n: float = 5.0
     jam_spiral_boost_steps: int = 12
@@ -51,7 +50,7 @@ class SearchStepResult:
 
 
 class CompliantSearchController:
-    """Force-regulated contact + Archimedean spiral XY bias (no open-loop axial push)."""
+    """Force-regulated contact + Archimedean spiral XY (constant-force Z)."""
 
     def __init__(self, config: CompliantSearchConfig | None = None) -> None:
         self.config = config or CompliantSearchConfig()
@@ -68,12 +67,7 @@ class CompliantSearchController:
         self._on_surface = False
         self._contact_steps = 0
         self._min_abs_fz_seek = 0.0
-        self._wrist_b_start: np.ndarray | None = None
-        self._along_travel_m = 0.0
-        self._wrist_travel_target_m = 0.0
-        self._surface_axial_travel: float | None = None
-        self._near_rim_steps = 0
-        self._rim_reached = False
+        self._f_push_target = float(self.config.push_force_n)
 
     def reset(
         self,
@@ -81,7 +75,7 @@ class CompliantSearchController:
         wrench_right6: np.ndarray,
         *,
         wrist_xyz: np.ndarray | None = None,
-        along_at_b_m: float | None = None,
+        already_on_surface: bool = False,
     ) -> None:
         self._frame = frame
         self._steps = 0
@@ -93,24 +87,25 @@ class CompliantSearchController:
         self._baseline_fz = float(wh[2])
         self._peak_abs_fz = abs(self._baseline_fz)
         self._push_sign = 1.0
-        self._spiral_origin = frame.origin_world.copy()
-        self._prev_wrist = None
-        self._jam_spiral_boost = 0
-        self._on_surface = False
-        self._contact_steps = 0
-        cfg = self.config
-        self._min_abs_fz_seek = abs(self._baseline_fz)
-        self._wrist_b_start = (
+        wrist0 = (
             np.asarray(wrist_xyz, dtype=np.float64).reshape(3).copy()
             if wrist_xyz is not None
             else frame.origin_world.copy()
         )
-        along_b = float(along_at_b_m if along_at_b_m is not None else cfg.along_surface_m + 0.05)
-        self._along_travel_m = max(0.0, along_b - cfg.along_surface_m)
-        self._wrist_travel_target_m = self._along_travel_m * cfg.wrist_along_scale
-        self._surface_axial_travel = None
-        self._near_rim_steps = 0
-        self._rim_reached = False
+        self._spiral_origin = wrist0.copy()
+        self._prev_wrist = None
+        self._jam_spiral_boost = 0
+        self._contact_steps = 0
+        self._min_abs_fz_seek = abs(self._baseline_fz)
+        self._on_surface = bool(already_on_surface)
+        # Already in contact: hold ~current |Fz| (don't retreat because |Fz|>push_force).
+        if self._on_surface:
+            self._peak_abs_fz = max(self._peak_abs_fz, abs(self._baseline_fz))
+            self._f_push_target = max(
+                float(self.config.push_force_n), abs(self._baseline_fz)
+            )
+        else:
+            self._f_push_target = float(self.config.push_force_n)
 
     def recover_from_jam(
         self,
@@ -118,27 +113,14 @@ class CompliantSearchController:
         wrench_right6: np.ndarray,
         wrist_xyz: np.ndarray,
     ) -> None:
-        self._frame = frame
-        self._wrench_filt = TaskFrame.lpf_wrench(
-            wrench_right6, None, self.config.wrench_lpf_alpha
+        self.reset(
+            frame,
+            wrench_right6,
+            wrist_xyz=wrist_xyz,
+            already_on_surface=False,
         )
-        wh = frame.wrench_tool(self._wrench_filt)
-        self._baseline_fz = float(wh[2])
-        self._peak_abs_fz = abs(self._baseline_fz)
-        self._push_sign = 1.0
-        self._spiral_origin = np.asarray(wrist_xyz, dtype=np.float64).reshape(3).copy()
-        self._theta = 0.0
         self._steps = max(0, self.config.min_search_steps - 1)
-        self._prev_wrist = None
         self._jam_spiral_boost = self.config.jam_spiral_boost_steps
-        self._on_surface = False
-        self._contact_steps = 0
-        cfg = self.config
-        self._min_abs_fz_seek = abs(self._baseline_fz)
-        self._wrist_b_start = np.asarray(wrist_xyz, dtype=np.float64).reshape(3).copy()
-        self._surface_axial_travel = None
-        self._near_rim_steps = 0
-        self._rim_reached = False
 
     def reset_steps_only(self) -> None:
         self._steps = 0
@@ -175,42 +157,16 @@ class CompliantSearchController:
             return frame.to_tool((w - self._prev_wrist) / step_dt)
         if prev_delta_xyz is not None:
             step_dt = max(float(dt if dt is not None else self.config.dt), 1e-6)
-            return frame.to_tool(np.asarray(prev_delta_xyz, dtype=np.float64).reshape(3) / step_dt)
+            return frame.to_tool(
+                np.asarray(prev_delta_xyz, dtype=np.float64).reshape(3) / step_dt
+            )
         return np.zeros(3, dtype=np.float64)
 
     def _axial_admit_tool_z(self, fz_meas: float, v_z: float) -> float:
         cfg = self.config
-        f_err = cfg.push_force_n - abs(float(fz_meas))
+        # Drive |Fz| toward contact target (ConnTact constant-force).
+        f_err = float(self._f_push_target) - abs(float(fz_meas))
         return float(cfg.admittance_k_z * f_err - cfg.admittance_b * v_z)
-
-    def _wrist_travel_along(self, frame: TaskFrame, wrist: np.ndarray) -> float:
-        assert self._wrist_b_start is not None
-        w = np.asarray(wrist, dtype=np.float64).reshape(3)
-        return float(np.dot(w - self._wrist_b_start, frame.approach_axis))
-
-    def _near_rim(self, frame: TaskFrame, wrist: np.ndarray) -> bool:
-        if self._wrist_travel_target_m <= 1e-6:
-            return True
-        traveled = self._wrist_travel_along(frame, wrist)
-        return traveled >= self._wrist_travel_target_m * self.config.rim_travel_frac
-
-    def _strip_inward_axial(
-        self,
-        frame: TaskFrame,
-        delta: np.ndarray,
-        wrist: np.ndarray,
-    ) -> np.ndarray:
-        if self._surface_axial_travel is None:
-            return delta
-        cfg = self.config
-        d = np.asarray(delta, dtype=np.float64).reshape(3)
-        current = self._wrist_travel_along(frame, wrist)
-        axial = float(np.dot(d, frame.approach_axis))
-        limit = self._surface_axial_travel + cfg.spiral_axial_slop_m
-        if current + axial > limit and axial > 0.0:
-            axial = max(0.0, limit - current)
-        lat = d - frame.approach_axis * float(np.dot(d, frame.approach_axis))
-        return lat + frame.approach_axis * axial
 
     def step(
         self,
@@ -244,41 +200,25 @@ class CompliantSearchController:
 
         if not self._on_surface:
             self._contact_steps += 1
-            traveled = self._wrist_travel_along(frame, wrist)
-            near_rim = self._near_rim(frame, wrist)
-            if near_rim:
-                self._rim_reached = True
-            if self._rim_reached:
-                self._near_rim_steps += 1
-                v_tool = self._v_tool(frame, wrist, dt=dt, prev_delta_xyz=prev_delta_xyz)
-                admit_tool = np.zeros(3, dtype=np.float64)
-                admit_tool[2] = self._axial_admit_tool_z(fz, v_tool[2])
-                delta = self._clip_norm(frame.to_world(admit_tool), cfg.max_admit_step_m)
-            else:
-                remaining = max(0.0, self._wrist_travel_target_m - traveled)
-                step_m = min(cfg.seek_axial_step_m, remaining)
-                delta = frame.axial_world(step_m)
+            v_tool = self._v_tool(frame, wrist, dt=dt, prev_delta_xyz=prev_delta_xyz)
+            admit_tool = np.zeros(3, dtype=np.float64)
+            admit_tool[2] = self._axial_admit_tool_z(fz, float(v_tool[2]))
+            delta = self._clip_norm(frame.to_world(admit_tool), cfg.max_admit_step_m)
             force_rise = abs(fz_raw) - self._min_abs_fz_seek
-            contact_ok = (
-                self._rim_reached
-                and self._near_rim_steps >= cfg.contact_min_seek_steps
-                and (
-                    force_rise >= cfg.contact_rise_n
-                    or abs(fz_raw) >= cfg.contact_min_n
-                )
+            contact_ok = self._contact_steps >= cfg.contact_min_seek_steps and (
+                force_rise >= cfg.contact_rise_n or abs(fz_raw) >= cfg.contact_min_n
             )
             if contact_ok:
                 self._on_surface = True
                 self._peak_abs_fz = abs(fz_raw)
                 self._baseline_fz = fz
-                self._surface_axial_travel = traveled
+                self._f_push_target = max(float(cfg.push_force_n), abs(fz_raw))
                 self._spiral_origin = wrist.copy()
                 self._prev_wrist = wrist.copy()
                 return SearchStepResult(False, False, "surface_contact", delta)
             if self._contact_steps >= cfg.contact_seek_max_steps:
-                self._on_surface = True
                 self._prev_wrist = wrist.copy()
-                return SearchStepResult(False, False, "surface_seek_timeout", delta)
+                return SearchStepResult(True, False, "surface_seek_timeout", delta)
             self._prev_wrist = wrist.copy()
             return SearchStepResult(False, False, "seeking_surface", delta)
 
@@ -293,8 +233,6 @@ class CompliantSearchController:
 
         if self._steps >= cfg.max_search_steps:
             self._prev_wrist = wrist.copy()
-            if self._peak_abs_fz >= cfg.contact_min_n:
-                return SearchStepResult(True, True, "search_contact_timeout", zero)
             return SearchStepResult(True, False, "search_timeout", zero)
 
         prev_theta = self._theta
@@ -303,28 +241,29 @@ class CompliantSearchController:
             cfg.spiral_radius_max_m,
             cfg.spiral_pitch_m * self._theta / (2.0 * np.pi + 1e-12),
         )
-        ref_delta = (
-            frame.spiral_offset_world(self._theta, radius)
-            - frame.spiral_offset_world(prev_theta, radius)
+        ref_delta = frame.spiral_offset_world(self._theta, radius) - frame.spiral_offset_world(
+            prev_theta, radius
         )
-        track = cfg.jam_spiral_track_gain if self._jam_spiral_boost > 0 else cfg.spiral_track_gain
+        track = (
+            cfg.jam_spiral_track_gain if self._jam_spiral_boost > 0 else cfg.spiral_track_gain
+        )
         if self._jam_spiral_boost > 0:
             self._jam_spiral_boost -= 1
         spiral_bias = ref_delta * track
 
+        # ConnTact: constant-force Z via |Fz| + spiral XY (+ light XY admit).
         v_tool = self._v_tool(frame, wrist, dt=dt, prev_delta_xyz=prev_delta_xyz)
         f_des = np.zeros(6, dtype=np.float64)
-        f_des[2] = self._push_sign * cfg.push_force_n
-        k = np.array([cfg.admittance_k_xy, cfg.admittance_k_xy, 0.0], dtype=np.float64)
-        comply = np.array([0.25, 0.25, 0.0], dtype=np.float64)
+        k_xy = np.array([cfg.admittance_k_xy, cfg.admittance_k_xy, 0.0], dtype=np.float64)
+        comply_xy = np.array([1.0, 1.0, 0.0], dtype=np.float64)
         admit_lat = frame.admit_step(
-            f_des, wh, v_tool, K=k, B=cfg.admittance_b, comply_mask=comply
+            f_des, wh, v_tool, K=k_xy, B=cfg.admittance_b, comply_mask=comply_xy
         )
+        admit_tool = np.zeros(3, dtype=np.float64)
+        admit_tool[2] = self._axial_admit_tool_z(fz, float(v_tool[2]))
+        admit_axial = frame.to_world(admit_tool)
 
-        delta = self._clip_lateral(frame, spiral_bias + admit_lat)
-        delta = self._strip_inward_axial(frame, delta, wrist)
-        axial = frame.approach_axis * float(np.dot(delta, frame.approach_axis))
-        delta = delta - axial
+        delta = self._clip_lateral(frame, spiral_bias + admit_lat + admit_axial)
         delta = self._clip_norm(delta, cfg.max_admit_step_m)
         self._prev_wrist = wrist.copy()
         return SearchStepResult(False, False, "searching", delta)
