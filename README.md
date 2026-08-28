@@ -1,11 +1,10 @@
-# SoftContact Bias Probe is Phase A of PCI — dual-arm privileged compliant insert
+# Privileged Compliant Insert（PCI）
 
 仓库：[wangrp1997/priv-compliant-insert](https://github.com/wangrp1997/priv-compliant-insert)  
-本地目录：`priv_compliant_insert`  
-简称：**PCI**（Privileged Compliant Insert）
+简称：**PCI**（双臂特权柔顺插孔）
 
 目标：双臂 bimanual assembly **handoff 后柔顺插孔**。  
-当前里程碑：**偏置孔 + PBVS ALIGN + 力门控贴面**（插不进、轻触停），再进入 Phase B 双臂柔顺精插。
+当前里程碑（Phase A）：**偏置孔 + PBVS ALIGN + 力门控贴面**（插不进、轻触停），再进入 Phase B 双臂柔顺精插。
 
 ## 快速跑（贴面 smoke）
 
