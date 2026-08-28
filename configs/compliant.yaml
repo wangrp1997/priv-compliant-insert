@@ -1,0 +1,26 @@
+# Phase B — compliant insert (literature-based, NOT echo_insert)
+
+search:
+  # PSFT / spiral search (RA-L 2020, I-RIM 2020)
+  push_force_n: 3.0              # constant force against hole plane
+  spiral_type: partial            # partial | archimedean
+  spiral_radius_max_m: 0.012
+  spiral_step_rad: 0.15
+  max_search_steps: 200
+  hole_detect_fz_drop_n: 1.5      # Fz drop => entered hole
+
+insert:
+  # Task-space admittance (Insert-One / UR3 impedance phase)
+  admittance_k_axial: 0.0002      # m/N along hole axis
+  admittance_k_lateral: 0.00005
+  damping_ratio: 0.7
+  f_axial_limit_n: 10.0
+  f_lateral_limit_n: 4.0
+  f_insert_des_n: 5.0
+  stall_patience: 15
+  retreat_step_m: 0.002
+  max_insert_steps: 500
+
+release:
+  open_rate: 0.15
+  max_release_steps: 80

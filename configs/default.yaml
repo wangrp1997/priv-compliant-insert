@@ -1,0 +1,97 @@
+# PCI — socket bias PBVS + Phase B compliant
+
+approach:
+  mode: pbvs_coarse_align
+  pbvs_standoff_m: 0.055
+  standoff_tol_m: 0.012
+  lat_gate_m: 0.012
+  angle_tol_rad: 0.14
+  max_align_steps: 800
+  handoff_settle_frames: 30
+  # 双臂相对 PBVS（ALIGN 段轻分担；接触后会冻左）
+  left_share_xy: 0.30
+  left_share_rot: 0.20
+  freeze_left_arm_at_handoff: false
+  pbvs_lambda_xy: 0.50
+  pbvs_lambda_z: 0.22
+  pbvs_lambda_rot: 0.12
+  max_left_wrist_step_m: 0.002
+  pos_tol_m: 0.004
+  axis_align_max_lat_m: 0.008
+  insert_align_confirm_frames: 99999
+  peg_lost_abort_frames: 9999
+  # 轻触：慢 EMA 残差 |Fz−EMA|（前三验证过的版本）
+  surface_min_lat_m: 0.006
+  surface_hold_frames: 18
+  surface_fail_hold_frames: 15
+  surface_tray_lost_frames: 20
+  surface_force_baseline_frames: 40
+  surface_force_soft_delta_n: 1.0
+  surface_force_delta_n: 1.6
+  surface_force_confirm_frames: 1
+  surface_force_arm_after_steps: 60
+  surface_left_grasp_scale: 1.30
+  surface_left_grasp_scale_init: 1.12
+  surface_unload_retract_m: 0.0
+  socket_bias:
+    lat_std_m: 0.010
+    min_lat_m: 0.008
+    max_lat_m: 0.014
+    max_resamples: 8
+    seed: 0
+
+sim:
+  max_seconds: 50.0
+  max_control_steps: 1200
+  max_pos_step_m: 0.0035
+  max_rot_step_rad: 0.02
+  fps: 30
+  dexjoco_root: /home/wangrenpeng/dexjoco
+
+compliant:
+  search:
+    push_force_n: 3.0
+    admittance_k_z: 0.00035
+    admittance_k_xy: 0.00004
+    admittance_b: 0.00012
+    wrench_lpf_alpha: 0.35
+    spiral_track_gain: 0.25
+    spiral_pitch_m: 0.0004
+    spiral_step_rad: 0.15
+    spiral_radius_max_m: 0.012
+    max_lat_step_m: 0.0008
+    max_admit_step_m: 0.0012
+    f_axial_max_n: 10.0
+    retreat_step_m: 0.0008
+    max_search_steps: 600
+    min_search_steps: 20
+    contact_min_n: 3.0
+    contact_seek_max_steps: 150
+    hole_detect_fz_drop_n: 1.2
+    hole_f_max_n: 5.0
+    jam_spiral_boost_steps: 12
+    jam_spiral_track_gain: 0.55
+  insert:
+    admittance_k_axial: 0.00025
+    admittance_k_lateral: 0.00004
+    admittance_b: 0.00012
+    wrench_lpf_alpha: 0.35
+    max_admit_step_m: 0.0012
+    f_axial_limit_n: 10.0
+    f_lateral_limit_n: 8.0
+    f_insert_des_n: 4.0
+    stall_patience: 12
+    retreat_step_m: 0.0012
+    max_insert_steps: 600
+  pipeline:
+    max_jam_recoveries: 5
+  release:
+    open_rate: 0.15
+    max_release_steps: 80
+  fingers:
+    k_admit: 0.0004
+    max_joint_step: 0.025
+    balance_gain: 0.12
+    f_balance_des_n: 2.0
+    b_admit: 0.35
+    enable: true

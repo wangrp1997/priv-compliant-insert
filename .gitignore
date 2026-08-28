@@ -1,0 +1,22 @@
+# runtime / local
+outputs/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+*.mp4
+*.pkl
+*.pt
+*.ckpt
+
+# cloned reference repos (keep notes in docs/)
+refs/
+
+# editor
+.idea/
+.vscode/
+*.swp
