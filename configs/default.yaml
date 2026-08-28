@@ -3,9 +3,9 @@
 approach:
   mode: pbvs_coarse_align
   pbvs_standoff_m: 0.055
-  standoff_tol_m: 0.012
-  lat_gate_m: 0.012
-  angle_tol_rad: 0.14
+  standoff_tol_m: 0.015
+  lat_gate_m: 0.015
+  angle_tol_rad: 0.18
   max_align_steps: 800
   handoff_settle_frames: 30
   # 双臂相对 PBVS（ALIGN 段轻分担；接触后会冻左）
@@ -16,8 +16,8 @@ approach:
   pbvs_lambda_z: 0.22
   pbvs_lambda_rot: 0.12
   max_left_wrist_step_m: 0.002
-  pos_tol_m: 0.004
-  axis_align_max_lat_m: 0.008
+  pos_tol_m: 0.0055
+  axis_align_max_lat_m: 0.010
   insert_align_confirm_frames: 99999
   peg_lost_abort_frames: 9999
   # 轻触：慢 EMA 残差 |Fz−EMA|（前三验证过的版本）
