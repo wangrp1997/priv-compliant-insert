@@ -10,8 +10,10 @@
 ## 快速跑（贴面 smoke）
 
 ```bash
-cd /home/wangrenpeng/priv_compliant_insert
-MUJOCO_GL=egl PYTHONPATH="src:/home/wangrenpeng/dexjoco:/home/wangrenpeng/dexjoco/dexjoco:/home/wangrenpeng/dexjoco/embodied_grasp_insertion:/home/wangrenpeng/reach_insert_rl" \
+# 需先 clone: https://github.com/wangrp1997/dexjoco
+export DEXJOCO=/path/to/dexjoco
+cd /path/to/priv-compliant-insert
+MUJOCO_GL=egl PYTHONPATH="src:${DEXJOCO}:${DEXJOCO}/dexjoco:${DEXJOCO}/embodied_grasp_insertion:${DEXJOCO}/../reach_insert_rl" \
   python scripts/smoke_pbvs_surface.py --episode 1 --seed 0
 ```
 
@@ -25,5 +27,5 @@ MUJOCO_GL=egl PYTHONPATH="src:/home/wangrenpeng/dexjoco:/home/wangrenpeng/dexjoc
 
 ## 依赖
 
-- DexJoCo：`/home/wangrenpeng/dexjoco`
-- Python 3.11+，`PYTHONPATH` 含 `src` 与 dexjoco
+- DexJoCo：[wangrp1997/dexjoco](https://github.com/wangrp1997/dexjoco)
+- Python 3.11+，`PYTHONPATH` 含本仓 `src` 与 DexJoCo
