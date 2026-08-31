@@ -100,21 +100,21 @@ compliant:
     left_axial_share: 0.0
     left_unload_share: 0.0
     right_lat_scale: 1.0
-    hold_press_m: 0.00010
-    contact_f_des_n: 0.55
-    contact_f_max_n: 1.4
-    contact_press_gain: 0.00020
+    hold_press_m: 0.00018
+    contact_f_des_n: 0.90
+    contact_f_max_n: 1.8
+    contact_press_gain: 0.00028
     contact_use_residual: true
     admittance_k_z: 0.00025
     admittance_k_xy: 4.0e-05
     admittance_b: 0.00012
     wrench_lpf_alpha: 0.35
-    spiral_track_gain: 1.2
+    spiral_track_gain: 1.5
     spiral_pitch_m: 0.002
     spiral_step_rad: 0.14
     spiral_radius_max_m: 0.05
-    max_lat_step_m: 0.0015
-    max_admit_step_m: 0.0015
+    max_lat_step_m: 0.0020
+    max_admit_step_m: 0.0020
     f_axial_max_n: 10.0
     retreat_step_m: 0.0008
     max_search_steps: 2400
@@ -150,7 +150,7 @@ compliant:
     insert_pure_axial_lat_m: 0.0018
     jam_spiral_boost_steps: 12
     jam_spiral_track_gain: 1.0
-    discrete_hop: true
+    discrete_hop: false
     hop_lift_m: 0.0015
     hop_press_m: 0.0004
     hop_period_steps: 12
