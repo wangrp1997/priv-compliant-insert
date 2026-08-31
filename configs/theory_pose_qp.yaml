@@ -1,5 +1,5 @@
-# privileged_diagnostic — r26 handoff-lock left/tray (μ=0.45 untouched)
-# 目标: handoff 后左手抓取+tray 世界姿态保持；tilt 一律相对 handoff
+# privileged_diagnostic — r28 residual force spiral (no open-loop slam; μ=0.45)
+# handoff 锁左手/tray；SEARCH 用残差力环轻贴面，禁止硬怼
 theory_pose_qp: true
 approach:
   mode: pbvs_coarse_align
@@ -100,9 +100,11 @@ compliant:
     left_axial_share: 0.0
     left_unload_share: 0.0
     right_lat_scale: 1.0
-    hold_press_m: 0.0002
-    contact_f_des_n: 0.45
-    contact_press_gain: 0.0
+    hold_press_m: 0.00010
+    contact_f_des_n: 0.55
+    contact_f_max_n: 1.4
+    contact_press_gain: 0.00020
+    contact_use_residual: true
     admittance_k_z: 0.00025
     admittance_k_xy: 4.0e-05
     admittance_b: 0.00012
@@ -138,8 +140,8 @@ compliant:
     priv_enter_along_max_m: 0.1
     priv_enter_require_along: false
     priv_enter_require_force: true
-    near_hole_press_m: 0.00035
-    # 力够停压：表面螺旋不再强制下压地板，防 peg 滑 tip
+    near_hole_press_m: 0.00012
+    # 残差力环轻贴；不开环地板硬怼
     spiral_surface_press_scale: 0.0
     near_axial_keep_lat_m: 0.0018
     near_hole_left_share: 0.0
@@ -194,16 +196,16 @@ compliant:
     insert_max_tray_tilt_deg: 40.0
     insert_hard_tray_tilt_deg: 42.0
     # 实际比较的是 |resid_fz|（相对 baseline）；力够则 unload，防持续下压滑 tip
-    search_unload_if_abs_fz_n: 1.5
+    search_unload_if_abs_fz_n: 1.2
     search_abs_fz_target_n: 99.0
-    search_unload_step_m: 0.0003
-    search_unload_cap_m: 0.003
-    tip_stuck_window: 45
-    tip_stuck_cmd_m: 0.012
+    search_unload_step_m: 0.00025
+    search_unload_cap_m: 0.006
+    tip_stuck_window: 60
+    tip_stuck_cmd_m: 0.015
     tip_stuck_move_m: 0.0004
-    tip_resync_window: 60
-    tip_resync_move_m: 0.0004
-    mocap_site_drift_cap_m: 0.01
+    tip_resync_window: 20
+    tip_resync_move_m: 0.00030
+    mocap_site_drift_cap_m: 0.004
     near_bottom_axial_drift_cap_m: 0.003
     settle_admit_frames: 40
     settle_stable_frames: 12
@@ -224,7 +226,7 @@ compliant:
     f_axial_limit_n: 12.0
     f_lateral_limit_n: 8.0
     f_insert_des_n: 0.8
-    hold_press_m: 0.00035
+    hold_press_m: 0.00012
     early_release_along_m: 0.018
     early_release_wait_frames: 12
     near_bottom_grasp_scale: 1.0

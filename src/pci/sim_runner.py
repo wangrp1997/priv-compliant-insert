@@ -2064,14 +2064,15 @@ def run_pci_episode(
         left_finger_force12=left_finger12,
     )
     surface_meta = dict(surface_meta)
-    # Phase B sensor Fz baseline must match wrist/tool frame (Phase A used hole-axis Fz).
-    if not priv_ctrl:
-        surface_meta["fz_baseline"] = float(_right_fz_sensor(raw, task_frame))
-        surface_meta["fz_baseline_frame"] = "wrist_tool"
-        print(
-            f"pci: sensor Fz baseline re-armed={surface_meta['fz_baseline']:+.2f}N",
-            flush=True,
-        )
+    # Always re-arm Fz baseline in wrist/tool frame at SEARCH entry.
+    # Phase-A hole-axis baseline is incomparable → fake |resid|~12N → permanent unload/slam.
+    surface_meta["fz_baseline"] = float(_right_fz_sensor(raw, task_frame))
+    surface_meta["fz_baseline_frame"] = "wrist_tool"
+    print(
+        f"pci: Fz baseline re-armed (wrist_tool)={surface_meta['fz_baseline']:+.2f}N "
+        f"priv_ctrl={bool(priv_ctrl)}",
+        flush=True,
+    )
     surface_meta["settle_seconds"] = settle_s
     surface_meta["settle_frames"] = settle_frames
     surface_meta["settle_tilt_peak_deg"] = settle_tilt_peak
@@ -2620,6 +2621,9 @@ def run_pci_episode(
             elif near_hole:
                 # On rim (along still above seat): recenter first, don't jam-press.
                 press_keep = float(search_cfg.get("near_hole_press_m", 0.00050))
+                f_hi_nh = float(search_cfg.get("contact_f_max_n", 1.2))
+                if resid_now_pre is not None and abs(float(resid_now_pre)) >= f_hi_nh:
+                    press_keep = 0.0  # residual heavy → no axial floor
                 seat_along = float(search_cfg.get("priv_enter_along_max_m", 0.100))
                 lat_now = float(feat_priv.lateral_m)
                 on_rim = along_now > seat_along
@@ -3228,6 +3232,11 @@ def run_pci_episode(
                 # Tip stuck while cmd moves: re-sync mocap to site, break air-spiral.
                 # Keep spiral theta — zeroing it every window froze r_cmd near ~2mm (r2).
                 site_sync = actual_action44_from_sites(raw)[0:6].copy()
+                # Micro re-contact along hole if residual under target (not slam).
+                f_des_rc = float(search_cfg.get("contact_f_des_n", 0.55))
+                if resid_now_pre is not None and abs(float(resid_now_pre)) < f_des_rc * 0.85:
+                    micro = float(search_cfg.get("hold_press_m", 0.0001))
+                    site_sync[0:3] = site_sync[0:3] + ax * micro
                 hold_right_wrist6 = site_sync
                 action44[0:6] = site_sync
                 resync_stuck = 0

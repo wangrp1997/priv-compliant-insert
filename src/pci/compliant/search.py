@@ -25,7 +25,9 @@ class CompliantSearchConfig:
     right_lat_scale: float = 1.0
     hold_press_m: float = 0.00035
     contact_f_des_n: float = 2.5
+    contact_f_max_n: float = 4.0  # residual unload threshold (vs baseline)
     contact_press_gain: float = 0.00025
+    contact_use_residual: bool = True  # press/unload on |Fz-baseline|, not abs(Fz)
     admittance_k_z: float = 0.0008
     admittance_k_xy: float = 0.00008
     admittance_b: float = 0.00012
@@ -338,27 +340,34 @@ class CompliantSearchController:
         admit_lat = self._clip_lat_scaled(frame, admit_lat, right_lim)
         right_lat = self._clip_norm(right_lat + admit_lat, cfg.max_admit_step_m)
 
-        # Maintain surface contact force (not open-loop slam).
-        # Force enough → stop press (no hold_press*0.6); avoids tip slip under load.
+        # Residual P-control toward contact_f_des (no open-loop slam).
+        # err>0 → light re-contact; err<0 → unload. Cap |press| tightly.
         fz = float(wrench_tool6[2])
-        f_abs = abs(fz)
         f_des = float(cfg.contact_f_des_n)
-        if f_abs < f_des:
-            press = float(cfg.hold_press_m) + float(cfg.contact_press_gain) * (f_des - f_abs)
+        use_resid = bool(getattr(cfg, "contact_use_residual", True))
+        if use_resid:
+            contact_load = abs(fz - float(self._baseline_fz))
         else:
-            press = 0.0
-        # Near hole: extra light press only while under contact target.
-        # Also boost press inside privileged reject band (monitor, not seek).
+            contact_load = abs(fz)
+        err = f_des - contact_load
+        gain = float(cfg.contact_press_gain)
+        if gain <= 0.0:
+            gain = 1.5e-4
+        press = gain * err
+        press_max = float(cfg.hold_press_m)
+        retreat = float(cfg.retreat_step_m) * 0.5
+        press = float(np.clip(press, -retreat, press_max))
+        # Near hole: only allow a fraction of near_hole_press when under-contact.
         reject_lat = float(getattr(cfg, "reject_hole_if_priv_lat_m", 0.0))
         near_band = float(cfg.priv_enter_lat_m) * 1.5
         if reject_lat > 0.0:
             near_band = max(near_band, reject_lat)
         if (
-            f_abs < f_des
+            err > 0.0
             and priv_lat_m is not None
             and float(priv_lat_m) <= near_band
         ):
-            press = max(press, float(cfg.near_hole_press_m))
+            press = max(press, min(float(cfg.near_hole_press_m) * 0.25, press_max))
         right_ax = frame.axial_world(+self._push_sign * press)
         left_ax = frame.axial_world(-self._push_sign * press * self._left_axial_share())
 
