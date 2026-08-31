@@ -2516,8 +2516,17 @@ def run_pci_episode(
         frame_left_lat_cmd = np.zeros(3, dtype=np.float64)
         site_before = site44[0:3].copy()
         if in_search:
-            # Accumulate on held mocap wrist — do NOT reset to site each step.
-            action44[0:6] = hold_right_wrist6
+            # Theory soft-surface spiral: command from actual site each step.
+            # Mocap accumulate drifts into air (r→50mm while tip lat stuck) and yanks peg.
+            site_rel = bool(search_cfg.get("search_site_relative_spiral", False)) or _theory_pose_qp(
+                cfg
+            )
+            if site_rel:
+                action44[0:6] = actual_action44_from_sites(raw)[0:6]
+                hold_right_wrist6 = action44[0:6].copy()
+            else:
+                # Legacy: accumulate on held mocap wrist.
+                action44[0:6] = hold_right_wrist6
             planar = delta - ax * float(np.dot(delta, ax))
             axial = ax * float(np.dot(delta, ax))
             unload_acc = float(surface_meta.get("_search_unload_acc_m", 0.0))

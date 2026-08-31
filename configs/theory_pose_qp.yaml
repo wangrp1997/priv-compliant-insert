@@ -141,22 +141,23 @@ compliant:
     priv_enter_require_along: false
     priv_enter_require_force: true
     near_hole_press_m: 0.00012
-    # 残差力环轻贴；不开环地板硬怼
+    # 残差力环轻贴；site 相对螺旋，禁止 mocap 空转硬怼 tip
     spiral_surface_press_scale: 0.0
+    search_site_relative_spiral: true
     near_axial_keep_lat_m: 0.0018
     near_hole_left_share: 0.0
     insert_left_share: 0.15
     insert_pure_axial_lat_m: 0.0018
     jam_spiral_boost_steps: 12
     jam_spiral_track_gain: 1.0
-    discrete_hop: false
-    hop_lift_m: 0.0035
-    hop_press_m: 0.0012
-    hop_period_steps: 9
-    hop_lift_step_m: 0.0015
-    hop_press_step_m: 0.00035
-    hop_clear_m: 0.0015
-    hop_lift_cmd_budget_m: 0.035
+    discrete_hop: true
+    hop_lift_m: 0.0015
+    hop_press_m: 0.0004
+    hop_period_steps: 12
+    hop_lift_step_m: 0.0006
+    hop_press_step_m: 0.00012
+    hop_clear_m: 0.0008
+    hop_lift_cmd_budget_m: 0.020
     abort_on_tray_lost: true
     search_max_tray_tilt_deg: 14.0
     search_hard_tray_tilt_deg: 22.0
