@@ -1,5 +1,5 @@
-# privileged_diagnostic — r28 residual force spiral (no open-loop slam; μ=0.45)
-# handoff 锁左手/tray；SEARCH 用残差力环轻贴面，禁止硬怼
+# privileged_diagnostic — r35 pose-hold: no ALIGN λrot twist; μ=0.45
+# handoff 锁左手；禁 PBVS 拧 peg；settle 回 handoff；残差轻贴不硬怼
 theory_pose_qp: true
 approach:
   mode: pbvs_coarse_align
@@ -18,8 +18,9 @@ approach:
   surface_freeze_left_hand: true
   surface_phase_a_left_qp_fingers: false
   pbvs_lambda_xy: 0.4
-  pbvs_lambda_z: 0.08
-  pbvs_lambda_rot: 0.06
+  pbvs_lambda_z: 0.06
+  pbvs_lambda_rot: 0.025
+  soft_contact_lambda_rot: 0.0
   max_left_wrist_step_m: 0.0025
   pos_tol_m: 0.006
   axis_align_max_lat_m: 0.014
@@ -54,24 +55,24 @@ approach:
   surface_settle_hard_tilt_deg: 20.0
   surface_settle_unload_m: 0.003
   surface_resid_unload_max_steps: 40
-  surface_contact_unload_m: 0.0045
+  surface_contact_unload_m: 0.005
   surface_deliver_left_admit_scale: 0.0
   surface_align_left_admit_scale: 0.0
   surface_soft_left_admit_scale: 0.0
   surface_hold_left_admit_scale: 0.0
   soft_contact_relatch: false
-  deliver_re_latch_enable: true
-  soft_latch_max_tilt_deg: 12.0
+  deliver_re_latch_enable: false
+  soft_latch_max_tilt_deg: 8.0
   surface_soft_latch_max_along_m: 0.12
   early_latch_enable: false
   early_latch_max_tilt_deg: 6.0
   early_latch_rel_rot_rad: 0.1
-  deliver_re_latch_max_tilt_deg: 8.0
+  deliver_re_latch_max_tilt_deg: 4.0
   surface_resid_ok_n: 0.35
   surface_resid_unload_step_m: 0.0004
   surface_resid_unload_cap_m: 0.008
-  hover_assist_lambda_z_cap: 0.06
-  soft_contact_lambda_z: 0.015
+  hover_assist_lambda_z_cap: 0.05
+  soft_contact_lambda_z: 0.012
   socket_bias:
     lat_std_m: 0.012
     min_lat_m: 0.008
@@ -213,11 +214,12 @@ compliant:
     settle_admit_left_scale: 0.2
     settle_unload_step_m: 0.0003
     settle_unload_cap_m: 0.004
-    settle_straighten_max_tilt_deg: 8.0
-    settle_straighten_stable_frames: 6
-    settle_straighten_max_frames: 80
-    settle_open_search_max_tilt_deg: 10.0
-    settle_soft_continue_search: false
+    settle_straighten_max_tilt_deg: 10.0
+    settle_straighten_stable_frames: 4
+    settle_straighten_max_frames: 100
+    settle_open_search_max_tilt_deg: 12.0
+    settle_soft_continue_search: true
+    settle_handoff_left_blend: 0.20
   insert:
     admittance_k_axial: 0.0003
     admittance_k_lateral: 0.0007

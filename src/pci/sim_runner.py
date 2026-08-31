@@ -469,6 +469,8 @@ def run_pbvs_biased_surface_press(
     left_arm_handoff = None
     if freeze_left and getattr(ctrl, "_hold_l_arm", None) is not None:
         left_arm_handoff = np.asarray(ctrl._hold_l_arm, dtype=np.float64).reshape(22).copy()
+        meta["left_arm_handoff"] = left_arm_handoff.tolist()
+        meta["handoff_left_locked"] = bool(freeze_left and freeze_left_hand)
 
     # Theory pose-hold: early latch + Phase-A grasp QP (before ALIGN wrenches tray).
     from scipy.spatial.transform import Rotation as R
@@ -901,7 +903,7 @@ def run_pbvs_biased_surface_press(
         if not isinstance(meta.get("latch_priv_geom"), PrivGraspGeom):
             meta["latch_priv_geom"] = copy_priv_grasp_geom(read_priv_grasp_geom(raw))
         meta["latch_priv_geom_ok"] = True
-        # r15: contact re-latch when peg∧tray and tray not tipped (better than early latch).
+        # Prefer flattest latch; do not re-latch tipped contact (locks tip pose).
         if (
             deliver_relatch_enable
             and use_pose_qp
@@ -909,7 +911,8 @@ def run_pbvs_biased_surface_press(
             and bool(outcome_f.tray_ok)
         ):
             tilt_deliver = _tray_tilt_entry_deg()
-            if tilt_deliver < deliver_relatch_deg:
+            best_t = float(best_latch_tilt_deg) if best_latch_snap is not None else 999.0
+            if tilt_deliver + 0.5 < best_t and tilt_deliver < deliver_relatch_deg:
                 snap_d = copy_priv_grasp_geom(read_priv_grasp_geom(raw))
                 meta["latch_priv_geom"] = snap_d
                 meta["latch_priv_geom_ok"] = True
@@ -921,6 +924,17 @@ def run_pbvs_biased_surface_press(
                     f"pci: deliver re-latch tilt={tilt_deliver:.1f}deg"
                     f"<{deliver_relatch_deg:.1f} "
                     f"rel={_rel_rot_err_rad(snap_d, read_priv_grasp_geom(raw)):.3f}rad",
+                    flush=True,
+                )
+            elif best_latch_snap is not None:
+                meta["latch_priv_geom"] = best_latch_snap
+                meta["latch_priv_geom_ok"] = True
+                meta["min_tilt_latch_deg"] = float(best_latch_tilt_deg)
+                if _phase_a_qp_enable(cfg) and phase_a_qp is not None:
+                    _reset_phase_a_qp(best_latch_snap)
+                print(
+                    f"pci: keep min-tilt latch {best_latch_tilt_deg:.1f}deg "
+                    f"(skip tipped re-latch {tilt_deliver:.1f}deg)",
                     flush=True,
                 )
         return steps, why, meta
@@ -1129,7 +1143,8 @@ def run_pbvs_biased_surface_press(
                     ctrl.config.pbvs_lambda_xy = 0.0
                     soft_z = float(a_cfg.get("soft_contact_lambda_z", 0.015))
                     ctrl.config.pbvs_lambda_z = min(ctrl.config.pbvs_lambda_z, soft_z)
-                    ctrl.config.pbvs_lambda_rot = min(ctrl.config.pbvs_lambda_rot, 0.010)
+                    soft_rot = float(a_cfg.get("soft_contact_lambda_rot", 0.0))
+                    ctrl.config.pbvs_lambda_rot = soft_rot
                     if getattr(ctrl, "_hold_l_arm", None) is None:
                         site_l = actual_action44_from_sites(raw)[22:44].copy()
                         if getattr(ctrl, "_hold_l_hand", None) is not None:
@@ -1762,8 +1777,12 @@ def run_pci_episode(
                 hard_settle = float(
                     cfg.get("approach", {}).get("surface_settle_hard_tilt_deg", 32.0)
                 )
-                # Do NOT left_tray_follow here: latch at tipped pose locks the tip.
-                # Pin left + light right unload so tray can spring upright.
+                # Blend left wrist toward handoff pose while unloading right (recover tip).
+                handoff_arm = surface_meta.get("left_arm_handoff")
+                handoff_l6 = None
+                if isinstance(handoff_arm, list) and len(handoff_arm) >= 6:
+                    handoff_l6 = np.asarray(handoff_arm, dtype=np.float64).reshape(-1)[0:6]
+                blend = float(scfg_s.get("settle_handoff_left_blend", 0.15))
                 wrist_ax_s = hole_u.copy()
                 unload_cap_s = float(scfg_s.get("settle_unload_cap_m", 0.002))
                 unload_acc_s = 0.0
@@ -1780,8 +1799,10 @@ def run_pci_episode(
                         step_u = min(unload_step_s, unload_cap_s - unload_acc_s)
                         settle44[0:3] = settle44[0:3] + wrist_ax_s * step_u
                         unload_acc_s += step_u
+                    if handoff_l6 is not None and blend > 0.0:
+                        hold_l_wrist = (1.0 - blend) * hold_l_wrist + blend * handoff_l6
                     cmd = settle44.copy()
-                    cmd[22:28] = hold_l_wrist  # left pinned
+                    cmd[22:28] = hold_l_wrist
                     cmd[28:44] = hold_l_hand
                     step_action44(gym_env, cmd, ego_recorder=ego_recorder)
                     out_j = env._labeler.compute(raw)
