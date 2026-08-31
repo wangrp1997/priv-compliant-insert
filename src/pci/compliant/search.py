@@ -339,20 +339,25 @@ class CompliantSearchController:
         right_lat = self._clip_norm(right_lat + admit_lat, cfg.max_admit_step_m)
 
         # Maintain surface contact force (not open-loop slam).
+        # Force enough → stop press (no hold_press*0.6); avoids tip slip under load.
         fz = float(wrench_tool6[2])
         f_abs = abs(fz)
         f_des = float(cfg.contact_f_des_n)
         if f_abs < f_des:
             press = float(cfg.hold_press_m) + float(cfg.contact_press_gain) * (f_des - f_abs)
         else:
-            press = float(cfg.hold_press_m) * 0.6
-        # Near hole: extra light press so tip can fall into mouth (force/along seat).
+            press = 0.0
+        # Near hole: extra light press only while under contact target.
         # Also boost press inside privileged reject band (monitor, not seek).
         reject_lat = float(getattr(cfg, "reject_hole_if_priv_lat_m", 0.0))
         near_band = float(cfg.priv_enter_lat_m) * 1.5
         if reject_lat > 0.0:
             near_band = max(near_band, reject_lat)
-        if priv_lat_m is not None and float(priv_lat_m) <= near_band:
+        if (
+            f_abs < f_des
+            and priv_lat_m is not None
+            and float(priv_lat_m) <= near_band
+        ):
             press = max(press, float(cfg.near_hole_press_m))
         right_ax = frame.axial_world(+self._push_sign * press)
         left_ax = frame.axial_world(-self._push_sign * press * self._left_axial_share())

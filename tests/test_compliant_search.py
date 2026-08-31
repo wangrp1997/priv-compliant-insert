@@ -75,6 +75,39 @@ def test_left_led_share_moves_tray_more() -> None:
         assert float(np.dot(r_lat, l_lat)) < 0.0
 
 
+def test_force_enough_stops_press() -> None:
+    """|Fz| >= contact_f_des → axial press = 0 (no hold*0.6 / near_hole boost)."""
+    cfg = CompliantSearchConfig(
+        min_search_steps=1,
+        max_search_steps=500,
+        hold_press_m=0.00035,
+        contact_f_des_n=0.45,
+        contact_press_gain=0.0,
+        near_hole_press_m=0.00050,
+        admittance_k_xy=0.0,
+        hole_detect_fz_drop_n=100.0,
+        hole_f_max_n=0.05,
+        contact_min_n=99.0,
+        spiral_try_insert_theta=1e9,
+        priv_assist=False,
+        priv_seek_step_m=0.0,
+        left_spiral_share=0.0,
+        left_axial_share=0.0,
+        wrench_lpf_alpha=1.0,
+        priv_enter_lat_m=0.0045,
+    )
+    ctrl = CompliantSearchController(cfg)
+    frame = _frame()
+    wrist = frame.origin_world.copy()
+    ctrl.reset(frame, np.zeros(6), wrist_xyz=wrist, already_on_surface=True)
+    wrench = np.zeros(6)
+    wrench[:3] = frame.approach_axis * 1.0  # |Fz_tool| ≈ 1.0 > 0.45
+    out = ctrl.step(frame, wrench, wrist, priv_lat_m=0.002)
+    assert out.reason == "searching"
+    axial = float(np.dot(out.delta_xyz, frame.approach_axis))
+    assert abs(axial) < 1e-9
+
+
 def test_dual_spiral_expands_relative() -> None:
     cfg = CompliantSearchConfig(
         min_search_steps=1,

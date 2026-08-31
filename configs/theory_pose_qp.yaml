@@ -139,7 +139,8 @@ compliant:
     priv_enter_require_along: false
     priv_enter_require_force: true
     near_hole_press_m: 0.00035
-    spiral_surface_press_scale: 0.35
+    # 力够停压：表面螺旋不再强制下压地板，防 peg 滑 tip
+    spiral_surface_press_scale: 0.0
     near_axial_keep_lat_m: 0.0018
     near_hole_left_share: 0.0
     insert_left_share: 0.15
@@ -192,10 +193,11 @@ compliant:
     insert_chamfer_stall_hold: 8
     insert_max_tray_tilt_deg: 40.0
     insert_hard_tray_tilt_deg: 42.0
-    search_unload_if_abs_fz_n: 99.0
+    # 实际比较的是 |resid_fz|（相对 baseline）；力够则 unload，防持续下压滑 tip
+    search_unload_if_abs_fz_n: 1.5
     search_abs_fz_target_n: 99.0
     search_unload_step_m: 0.0003
-    search_unload_cap_m: 0.0
+    search_unload_cap_m: 0.003
     tip_stuck_window: 45
     tip_stuck_cmd_m: 0.012
     tip_stuck_move_m: 0.0004

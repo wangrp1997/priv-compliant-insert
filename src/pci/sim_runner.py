@@ -2685,10 +2685,22 @@ def run_pci_episode(
                 frame_left_lat_cmd = left_lat_cmd
             else:
                 # Spiral with light axial so tip slides on surface (planar-only = mocap air).
+                # Force already at contact target → no press_keep floor (search axial only).
                 press_keep = float(search_cfg.get("near_hole_press_m", 0.00035)) * float(
                     search_cfg.get("spiral_surface_press_scale", 0.35)
                 )
-                delta = planar + ax * max(float(np.dot(delta, ax)), press_keep)
+                f_des_contact = float(search_cfg.get("contact_f_des_n", 0.45))
+                force_ok_press = (
+                    (
+                        resid_now_pre is not None
+                        and abs(float(resid_now_pre)) >= f_des_contact
+                    )
+                    or abs_fz_now >= f_des_contact
+                )
+                if force_ok_press:
+                    press_keep = 0.0
+                ax_from_search = float(np.dot(delta, ax))
+                delta = planar + ax * max(ax_from_search, press_keep)
                 hop_mode = "spiral"
                 if recovery_active and float(feat_priv.lateral_m) > recovery_lat_m:
                     hop_mode = "priv_recovery_seek"
