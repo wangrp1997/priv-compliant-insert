@@ -27,6 +27,22 @@ class TaskFrame:
         return cls(origin_world=origin, rot_world_tool=rot, approach_axis=approach)
 
     @classmethod
+    def from_wrist_site(
+        cls,
+        origin_world: np.ndarray,
+        rot_world_site: np.ndarray,
+        *,
+        approach_col: int = 2,
+    ) -> TaskFrame:
+        """Lock task frame from EE wrist site pose (deployable; no hole_axis)."""
+        origin = np.asarray(origin_world, dtype=np.float64).reshape(3).copy()
+        rot = np.asarray(rot_world_site, dtype=np.float64).reshape(3, 3).copy()
+        col = int(approach_col)
+        approach = rot[:, col].copy()
+        approach /= np.linalg.norm(approach) + 1e-12
+        return cls(origin_world=origin, rot_world_tool=rot, approach_axis=approach)
+
+    @classmethod
     def from_hole_axis(
         cls,
         origin_world: np.ndarray,

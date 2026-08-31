@@ -82,6 +82,7 @@ def main() -> int:
                 pipeline=pipeline,
                 force_labeler=force_labeler,
                 ego_recorder=recorder,
+                episode_index=ep,
             )
             summary["episode"] = ep
             summary["refs"] = ["ConnTact", "franka-peg-in-hole", "irl_control", "hybrid_insert"]
@@ -98,11 +99,13 @@ def main() -> int:
                 f"control_steps={summary['control_steps']} final={summary['final_phase']}"
             )
             print(
-                f"[pci-smoke] tip={summary['final_tip_dist_m']*1000:.1f}mm "
-                f"lat={summary['final_lat_m']*1000:.1f}mm along={summary['final_along_m']*1000:.1f}mm"
+                f"[pci-smoke] tip={summary.get('final_tip_dist_m', float('nan'))*1000:.1f}mm "
+                f"lat={summary.get('final_lat_m', float('nan'))*1000:.1f}mm "
+                f"along={summary.get('final_along_m', float('nan'))*1000:.1f}mm"
             )
             print(f"[pci-smoke] wrote {out_path}")
             if video_path is not None and video_path.is_file():
+                # Always keep video for every experiment (success or tray fail).
                 print(f"[pci-smoke] ego_video={video_path}")
             if not summary["success"]:
                 exit_code = 1

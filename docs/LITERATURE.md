@@ -34,12 +34,22 @@ ALIGN 完成（孔口 standoff）
 
 ---
 
-## B1 螺旋搜索（力引导）
+## B1 为什么灵巧手不能省螺旋（理论）
 
-- 恒压 `F_push` 贴住孔所在平面（沿 −hole_axis）
-- XY 平面 **Archimedean / 部分螺旋 PSFT**（参考 I-RIM 2020、PSFT 2020）
-- **入孔判据**：`F_z` 骤降或 contact 变化（Lee 2022 / contact-state 文献）
-- 双臂：左臂 frozen/slow，右臂执行搜索
+夹爪 peg 常近似刚连腕部：位姿误差小、F/T 干净，对准后可直接柔顺下插。  
+Allegro 类**多指抓取**不同：
+
+1. **位姿不确定更大**：指尖接触几何 + 抓取重配置 → peg–腕相对位姿漂移（Lee dual-arm RA-L 2022）。
+2. **腕 F/T 被握持力污染**：绝对 `|Fz|` 含 grasp bias，不能单靠绝对值判离面。
+3. **接触状态机需要搜索相**：力引导装配用 Archimedean / PSFT 贴面扫孔（ORBilu 2014；PSFT RA-L 2020；arXiv:2003.03047）。
+
+因此保留 **B1 贴面柔顺螺旋 → B2 柔顺插入**。螺旋是搜索相，不是 hop 离面。
+
+**双臂协同柔顺螺旋（PCI 实现）**：
+- 右臂：轻压贴面 + XY 螺旋弦（相对孔平面）
+- 左臂：**不冻结**；横向反向分担 `left_spiral_share`，轴向轻反 `left_axial_share`
+- 全程贴面（`discrete_hop: false`）；相对运动 = 右旋 − 左旋
+- 进孔：相对 F/T 卸力确认；握持偏置导致绝对值不可靠时，螺旋扫过后 `spiral_complete_try_insert` → B2
 
 ---
 
@@ -128,10 +138,14 @@ v1 是「力读数调步长的开环位姿」，不是导纳；无 `comply_axes`
 | `refs/irl_control` | OSC 任务空间导纳 `u ∝ F_ext` |
 | GraspQP / GeoDEx | 指力 QP / 触觉 admittance（参考，不必整库） |
 
-### 实现优先级
+## v3：特权相对姿态 + 指力 QP（2026-08）
 
-1. `task_frame.admit_step` + 轴选刚度  
-2. `insert.py` / `search.py` 改真导纳  
-3. `fingers.py` 关节导纳 + 力平衡  
-4. jam → 抬 z 回搜  
-5. 可选：轻量接触态 / QP 指力
+**合规**: `privileged_diagnostic`，控制环读 peg/tray/tip 真值；**不计入**非特权成功率。
+
+**创新点**（相对锁指螺旋 / 纯腕 PSFT）:
+1. 贴面 latch 冻结 peg–tray 相对姿态 + 双手 in-hand 位姿（Pfanne 物体阻抗目标）
+2. 期望物体 wrench = 姿态误差阻抗 + 相对扭转内力偶（TUM 内外力思路）
+3. GraspQP 风格摩擦锥抓取矩阵 ``G`` + ``lsq_linear`` 有界指力再分配 → Allegro Δq
+4. 腕部仍做 spiral XY；相对平移默认不惩罚（搜孔自由）
+
+代码: `src/pci/compliant/priv_grasp_opt.py`，开关 `compliant.priv_grasp_opt.enable`。

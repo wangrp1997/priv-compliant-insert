@@ -11,20 +11,28 @@ from pci.task_frame import TaskFrame
 
 @dataclass
 class CompliantInsertConfig:
-    admittance_k_axial: float = 0.0002
-    admittance_k_lateral: float = 0.00005
-    admittance_b: float = 0.0001
+    admittance_k_axial: float = 0.00025
+    admittance_k_lateral: float = 0.00004
+    admittance_b: float = 0.00012
     wrench_lpf_alpha: float = 0.35
     f_axial_limit_n: float = 12.0
     f_lateral_limit_n: float = 10.0
-    f_insert_des_n: float = 5.0
-    stall_patience: int = 20
+    f_insert_des_n: float = 3.5
+    # Open-loop axial nudge; grasp bias makes pure admittance stall.
+    hold_press_m: float = 0.0005
+    left_insert_share: float = 0.20
+    stall_patience: int = 40
     retreat_step_m: float = 0.001
-    max_admit_step_m: float = 0.0015
-    max_insert_steps: int = 500
+    max_admit_step_m: float = 0.0018
+    max_insert_steps: int = 1200
     open_rate: float = 0.15
     max_release_steps: int = 80
     dt: float = 1.0 / 30.0
+    # Micro-orbit when depth stalls (chamfer wedge).
+    wiggle_radius_m: float = 0.00035
+    wiggle_step_rad: float = 0.35
+    depth_stall_eps_m: float = 0.00005
+    depth_stall_patience: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +44,7 @@ class InsertStepResult:
     delta_xyz: np.ndarray
     finger_open: float = 0.0
     seat_detected: bool = False
+    delta_left_xyz: np.ndarray | None = None
 
 
 class CompliantInsertController:
@@ -45,6 +54,9 @@ class CompliantInsertController:
         self.config = config or CompliantInsertConfig()
         self._steps = 0
         self._stall = 0
+        self._depth_stall = 0
+        self._best_axial = 0.0
+        self._wiggle_theta = 0.0
         self._prev_axial = 0.0
         self._release_steps = 0
         self._releasing = False
@@ -62,6 +74,8 @@ class CompliantInsertController:
     ) -> None:
         self._steps = 0
         self._stall = 0
+        self._depth_stall = 0
+        self._wiggle_theta = 0.0
         self._release_steps = 0
         self._releasing = False
         self._wrench_filt = TaskFrame.lpf_wrench(
@@ -75,9 +89,11 @@ class CompliantInsertController:
             axial = self._axial_pos(frame, wrist_xyz)
             self._axial_at_reset = axial
             self._prev_axial = axial
+            self._best_axial = axial
         else:
             self._prev_axial = 0.0
             self._axial_at_reset = 0.0
+            self._best_axial = 0.0
         self._prev_wrist = (
             np.asarray(wrist_xyz, dtype=np.float64).reshape(3).copy()
             if wrist_xyz is not None
@@ -167,49 +183,81 @@ class CompliantInsertController:
             self._prev_wrist = wrist.copy()
             return InsertStepResult(True, False, "insert", "insert_timeout", zero)
 
-        axial_progress = axial_pos - self._prev_axial
-        # Stall: high force, or no meaningful progress since insert reset.
-        min_travel_m = 0.003
-        stressed = (
-            f_lat > cfg.f_lateral_limit_n
-            or f_ax_abs > cfg.f_axial_limit_n
-            or (axial_progress < 1e-5 and axial_travel < min_travel_m)
-        )
+        # Jam only on true force overload — wrist mocap travel is unreliable
+        # under hard contact + grasp-biased F/T (cmd moves, tip lags).
+        stressed = f_lat > cfg.f_lateral_limit_n or f_ax_abs > cfg.f_axial_limit_n
         if stressed:
             self._stall += 1
         else:
             self._stall = max(0, self._stall - 1)
 
-        jam = self._stall >= cfg.stall_patience or f_ax_abs > cfg.f_axial_limit_n * 0.95
+        jam = self._stall >= cfg.stall_patience or f_ax_abs > cfg.f_axial_limit_n * 0.98
         if jam:
             self._stall = 0
             lift = frame.axial_world(-self._push_sign * cfg.retreat_step_m)
+            left_lift = -float(np.clip(cfg.left_insert_share, 0.0, 0.5)) * lift
             self._prev_axial = axial_pos
             self._prev_wrist = wrist.copy()
-            return InsertStepResult(False, False, "insert", "retreat", lift)
+            return InsertStepResult(
+                False,
+                False,
+                "insert",
+                "retreat",
+                lift,
+                delta_left_xyz=left_lift,
+            )
 
         self._prev_axial = axial_pos
+        # Deeper = larger axial along push sign (depends on frame); track best travel.
+        travel = float(axial_pos - self._axial_at_reset) * float(self._push_sign)
+        best_travel = float(self._best_axial - self._axial_at_reset) * float(self._push_sign)
+        if travel > best_travel + float(cfg.depth_stall_eps_m):
+            self._best_axial = axial_pos
+            self._depth_stall = 0
+        else:
+            self._depth_stall += 1
 
-        # Insert: Z soft, XY stiff-but-not-zero (small lateral give for edge catch).
-        f_des = np.zeros(6, dtype=np.float64)
-        f_des[2] = self._push_sign * cfg.f_insert_des_n
-        k = np.array(
-            [cfg.admittance_k_lateral, cfg.admittance_k_lateral, cfg.admittance_k_axial],
-            dtype=np.float64,
-        )
-        comply = np.array([0.25, 0.25, 1.0], dtype=np.float64)
-
+        # Seat: always open-loop press into hole. Wrist |Fz|≈6N grasp bias must NOT
+        # cancel press (comparing to f_insert_des would zero axial forever).
         v_tool = self._v_tool(frame, wrist, dt=dt, prev_delta_xyz=prev_delta_xyz)
-        admit = frame.admit_step(
-            f_des, wh, v_tool, K=k, B=cfg.admittance_b, comply_mask=comply
+        f_des_lat = np.zeros(6, dtype=np.float64)
+        k_lat = np.array(
+            [cfg.admittance_k_lateral, cfg.admittance_k_lateral, 0.0], dtype=np.float64
         )
-        delta = self._clip_norm(admit, cfg.max_admit_step_m)
+        comply_lat = np.array([1.0, 1.0, 0.0], dtype=np.float64)
+        admit_lat = frame.admit_step(
+            f_des_lat, wh, v_tool, K=k_lat, B=cfg.admittance_b, comply_mask=comply_lat
+        )
+        # Chamfer unstick: small planar chord orbit when depth stalls.
+        wiggle = np.zeros(3, dtype=np.float64)
+        reason = "admitting"
+        if self._depth_stall >= int(cfg.depth_stall_patience) and float(cfg.wiggle_radius_m) > 0.0:
+            prev_th = float(self._wiggle_theta)
+            self._wiggle_theta = prev_th + float(cfg.wiggle_step_rad)
+            r = float(cfg.wiggle_radius_m)
+            wiggle = frame.spiral_offset_world(self._wiggle_theta, r) - frame.spiral_offset_world(
+                prev_th, r
+            )
+            wiggle = wiggle - frame.approach_axis * float(np.dot(wiggle, frame.approach_axis))
+            reason = "wiggle_press"
+        press = float(cfg.hold_press_m)
+        if f_lat > 0.5 * cfg.f_lateral_limit_n:
+            press *= 0.5  # ease axial when jammed sideways
+        if self._depth_stall >= int(cfg.depth_stall_patience):
+            press *= 0.6  # less wedge while orbiting
+        axial_right = frame.axial_world(+self._push_sign * press)
+        share = float(np.clip(cfg.left_insert_share, 0.0, 0.5))
+        axial_left = frame.axial_world(-self._push_sign * float(cfg.hold_press_m) * share)
+
+        right = self._clip_norm(admit_lat + axial_right + wiggle, cfg.max_admit_step_m)
+        left = self._clip_norm(axial_left, cfg.max_admit_step_m)
 
         self._prev_wrist = wrist.copy()
         return InsertStepResult(
             False,
             False,
             "insert",
-            "admitting",
-            delta,
+            reason,
+            right,
+            delta_left_xyz=left,
         )

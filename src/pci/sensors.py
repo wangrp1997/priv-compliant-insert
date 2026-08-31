@@ -44,3 +44,17 @@ def read_right_finger_force12(raw, labeler) -> np.ndarray:
     """Right-hand fingertip contact forces (12,) from ``FingerForceLabeler``."""
     frame = labeler.compute(raw)
     return np.asarray(frame.right_finger_force, dtype=np.float64).reshape(12).copy()
+
+
+def read_left_finger_force12(raw, labeler) -> np.ndarray:
+    """Left-hand fingertip contact forces (12,) from ``FingerForceLabeler``."""
+    frame = labeler.compute(raw)
+    return np.asarray(frame.left_finger_force, dtype=np.float64).reshape(12).copy()
+
+
+def read_dual_finger_force24(raw, labeler) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(right12, left12)`` fingertip forces from one labeler frame."""
+    frame = labeler.compute(raw)
+    right = np.asarray(frame.right_finger_force, dtype=np.float64).reshape(12).copy()
+    left = np.asarray(frame.left_finger_force, dtype=np.float64).reshape(12).copy()
+    return right, left

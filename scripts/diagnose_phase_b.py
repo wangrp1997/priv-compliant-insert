@@ -65,12 +65,13 @@ def main() -> int:
     from pci.sensors import read_right_finger_force12, read_wrist_wrench_world
     from pci.sim_runner import (
         _sim_dt,
+        actual_action44_from_sites,
         build_env_and_controllers,
         run_pbvs_biased_surface_press,
         step_action44,
     )
     from pci.task_frame import TaskFrame
-    from pci.wrist import apply_tip_delta44, hole_task_basis
+    from pci.wrist import apply_dual_wrist_delta44
 
     env, hybrid, pipeline, force_labeler = build_env_and_controllers(
         cfg, episode_indices=[args.episode]
@@ -92,7 +93,8 @@ def main() -> int:
             return 1
 
         feat0 = features_from_raw(raw)
-        action44 = current_action44(raw)
+        action44 = actual_action44_from_sites(raw)
+        # Freeze tool frame once at A→B; loop uses site xyz + F/T only.
         task_frame = TaskFrame.from_hole_axis(
             action44[0:3],
             feat0.hole_axis,
@@ -113,8 +115,6 @@ def main() -> int:
         b_start_feat = feat0
 
         hole_axis = feat0.hole_axis.copy()
-        tip0 = feat0.tip_pos.copy()
-        socket0 = feat0.socket_pos.copy()
         tool_hole_dot = float(np.dot(task_frame.approach_axis, hole_axis))
         peg_hole_dot = float(np.dot(feat0.peg_axis, hole_axis))
 
@@ -125,31 +125,43 @@ def main() -> int:
             finger12 = read_right_finger_force12(raw, force_labeler)
             feat = features_from_raw(raw)
             wh = task_frame.wrench_tool(wrench[0])
-            wh_raw = task_frame.wrench_tool(wrench[0])
             tip_before = feat.tip_pos.copy()
+            tip = np.asarray(feat.tip_pos, dtype=np.float64).reshape(3)
+            sock = np.asarray(feat.socket_pos, dtype=np.float64).reshape(3)
+            hole_u = feat.hole_axis / (np.linalg.norm(feat.hole_axis) + 1e-12)
+            lat_vec = tip - sock
+            lat_vec = lat_vec - hole_u * float(np.dot(lat_vec, hole_u))
             pr = pipeline.step(
                 wrench[0],
                 action44[0:3],
                 finger12,
                 insert_ok_eval=bool(outcome.insert_ok),
                 dt=_sim_dt(cfg),
+                priv_lat_m=float(feat.lateral_m),
+                priv_along_m=float(feat.along_m),
+                priv_lat_vec=lat_vec,
             )
+
             delta = np.asarray(pr.delta_xyz, dtype=np.float64).reshape(3)
             max_step = float(cfg.get("sim", {}).get("max_pos_step_m", 0.004))
             dn = float(np.linalg.norm(delta))
             if dn > max_step:
                 delta = delta * (max_step / dn)
                 dn = float(np.linalg.norm(delta))
+            left_delta = getattr(pr, "delta_left_xyz", None)
+            if left_delta is not None:
+                left_delta = np.asarray(left_delta, dtype=np.float64).reshape(3)
+                ln = float(np.linalg.norm(left_delta))
+                left_cap = max_step * 0.75
+                if ln > left_cap:
+                    left_delta = left_delta * (left_cap / ln)
 
-            action44 = apply_tip_delta44(action44, delta)
-            action44[6:22] = action44[6:22] + pr.delta_hand16
-            if pr.finger_open > 0.0:
-                action44[6:22] = hold_fingers * (1.0 - pr.finger_open)
+            action44 = apply_dual_wrist_delta44(action44, delta, left_delta)
+            action44[6:22] = hold_fingers
             step_action44(gym_env, action44)
 
             feat1 = features_from_raw(raw)
             tip_move = feat1.tip_pos - tip_before
-            tip_dist_delta = (feat1.tip_socket_dist_m - feat0.tip_socket_dist_m) * 1000
 
             traj.append(
                 {
@@ -170,10 +182,16 @@ def main() -> int:
                     "on_surface": bool(pipeline.search._on_surface),
                     "delta_norm_mm": dn * 1000,
                     "delta_xyz_mm": (delta * 1000).tolist(),
+                    "delta_left_xyz_mm": (
+                        (np.asarray(left_delta) * 1000).tolist()
+                        if left_delta is not None
+                        else None
+                    ),
                     "delta_along_hole_mm": _delta_along_hole(delta, hole_axis) * 1000,
                     "delta_along_tool_mm": _delta_along_tool(delta, task_frame.approach_axis) * 1000,
                     "tip_move_along_hole_mm": _delta_along_hole(tip_move, hole_axis) * 1000,
                     "along_mm_priv_eval": feat1.along_m * 1000,
+                    "site_cmd_mode": "dual_arm_compliant_spiral",
                     "f_des_z": float(pipeline.search._push_sign * pipeline.search.config.push_force_n)
                     if pr.phase == PipelinePhase.COMPLIANT_SEARCH
                     else float(pipeline.insert._push_sign * pipeline.insert.config.f_insert_des_n),
@@ -188,7 +206,19 @@ def main() -> int:
             reasons[row["reason"]] = reasons.get(row["reason"], 0) + 1
 
         seek = [r for r in traj if r["reason"] in ("seeking_surface", "surface_contact", "surface_seek_timeout")]
-        spiral = [r for r in traj if r["reason"] in ("searching", "force_retreat", "hole_detected")]
+        spiral = [
+            r
+            for r in traj
+            if r["reason"]
+            in (
+                "searching",
+                "hop_lift",
+                "hop_move",
+                "hop_press",
+                "force_retreat",
+                "hole_detected",
+            )
+        ]
 
         out = {
             "episode": args.episode,

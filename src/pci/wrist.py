@@ -11,6 +11,18 @@ def apply_tip_delta44(action44: np.ndarray, delta_xyz: np.ndarray) -> np.ndarray
     return out
 
 
+def apply_dual_wrist_delta44(
+    action44: np.ndarray,
+    delta_right_xyz: np.ndarray,
+    delta_left_xyz: np.ndarray | None = None,
+) -> np.ndarray:
+    """Right xyz at [0:3], left xyz at [22:25] (rotvec action44 layout)."""
+    out = apply_tip_delta44(action44, delta_right_xyz)
+    if delta_left_xyz is not None:
+        out[22:25] = out[22:25] + np.asarray(delta_left_xyz, dtype=np.float64).reshape(3)
+    return out
+
+
 def hole_task_basis(hole_axis_world: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return tangent1, tangent2, hole_axis (unit; insert motion uses -axis)."""
     axis = np.asarray(hole_axis_world, dtype=np.float64).reshape(3)

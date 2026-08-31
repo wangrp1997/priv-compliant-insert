@@ -11,7 +11,9 @@ import numpy as np
 
 from pci.compliant.fingers import FingerCompliantController, FingerCompliantConfig
 from pci.compliant.insert import CompliantInsertController, CompliantInsertConfig, InsertStepResult
+from pci.compliant.priv_grasp_opt import PrivGraspOptController, PrivGraspOptConfig
 from pci.compliant.search import CompliantSearchController, CompliantSearchConfig, SearchStepResult
+from pci.priv_geom import PrivGraspGeom
 from pci.task_frame import TaskFrame
 
 
@@ -32,6 +34,9 @@ class PipelineStepResult:
     delta_xyz: np.ndarray
     delta_hand16: np.ndarray
     finger_open: float = 0.0
+    delta_left_xyz: np.ndarray | None = None
+    delta_left_hand16: np.ndarray | None = None
+    priv_rel_rot_err_rad: float = 0.0
 
 
 @dataclass
@@ -41,7 +46,11 @@ class PipelineConfig:
 
 
 class InsertPipeline:
-    """Hybrid ALIGN (privileged, external) → sensor-only B1/B2 + finger compliance."""
+    """Hybrid ALIGN → B1/B2.
+
+    Default control: wrist F/T + fingertip forces (deployable).
+    Optional ``priv_grasp_opt`` is research-only and off by default.
+    """
 
     def __init__(
         self,
@@ -50,22 +59,32 @@ class InsertPipeline:
         insert_config: CompliantInsertConfig | None = None,
         finger_config: FingerCompliantConfig | None = None,
         pipeline_config: PipelineConfig | None = None,
+        priv_grasp_config: PrivGraspOptConfig | None = None,
     ) -> None:
         self.search = CompliantSearchController(search_config)
         self.insert = CompliantInsertController(insert_config)
-        self.fingers = FingerCompliantController(finger_config)
+        fcfg = finger_config or FingerCompliantConfig()
+        self.fingers = FingerCompliantController(fcfg)
+        # Left uses same tactile admittance gains (separate state).
+        self.fingers_left = FingerCompliantController(fcfg)
+        self.priv_grasp = PrivGraspOptController(priv_grasp_config)
         self.pipeline_config = pipeline_config or PipelineConfig()
         self._frame: TaskFrame | None = None
         self._hold_hand16: np.ndarray | None = None
+        self._hold_left_hand16: np.ndarray | None = None
         self._prev_delta_xyz = np.zeros(3, dtype=np.float64)
         self._dt = self.pipeline_config.default_dt
         self._jam_recoveries = 0
         self.phase = PipelinePhase.APPROACH
+        self._use_priv_grasp = bool(
+            (priv_grasp_config or PrivGraspOptConfig()).enable
+        )
 
     def reset(self) -> None:
         self.phase = PipelinePhase.APPROACH
         self._frame = None
         self._hold_hand16 = None
+        self._hold_left_hand16 = None
         self._prev_delta_xyz = np.zeros(3, dtype=np.float64)
         self._dt = self.pipeline_config.default_dt
         self._jam_recoveries = 0
@@ -83,10 +102,17 @@ class InsertPipeline:
         wrist_xyz: np.ndarray,
         *,
         already_on_surface: bool = False,
+        hold_left_hand16: np.ndarray | None = None,
+        priv_geom: PrivGraspGeom | None = None,
+        left_finger_force12: np.ndarray | None = None,
     ) -> None:
         self.phase = PipelinePhase.COMPLIANT_SEARCH
         self._frame = frame
         self._hold_hand16 = np.asarray(hold_hand16, dtype=np.float64).reshape(16).copy()
+        if hold_left_hand16 is not None:
+            self._hold_left_hand16 = np.asarray(hold_left_hand16, dtype=np.float64).reshape(16).copy()
+        else:
+            self._hold_left_hand16 = None
         self._prev_delta_xyz = np.zeros(3, dtype=np.float64)
         self._jam_recoveries = 0
         self.search.reset(
@@ -97,6 +123,11 @@ class InsertPipeline:
         )
         self.insert.reset(frame, wrench_right6, wrist_xyz)
         self.fingers.reset(finger_force12)
+        if left_finger_force12 is not None:
+            self.fingers_left.reset(left_finger_force12)
+        if self._use_priv_grasp and priv_geom is not None and self._hold_left_hand16 is not None:
+            self.priv_grasp.reset(priv_geom, self._hold_hand16, self._hold_left_hand16)
+        _ = left_finger_force12
 
     def _call_controller_step(
         self,
@@ -141,6 +172,11 @@ class InsertPipeline:
         *,
         insert_ok_eval: bool,
         dt: float | None = None,
+        priv_lat_m: float | None = None,
+        priv_along_m: float | None = None,
+        priv_lat_vec: np.ndarray | None = None,
+        priv_geom: PrivGraspGeom | None = None,
+        left_finger_force12: np.ndarray | None = None,
     ) -> PipelineStepResult:
         if self._frame is None or self._hold_hand16 is None:
             raise RuntimeError("call begin_compliant() after hybrid ALIGN")
@@ -150,11 +186,41 @@ class InsertPipeline:
 
         frame = self._frame
         hold = self._hold_hand16
-        delta_hand = self.fingers.step(finger_force12, hold)
+        delta_left_hand: np.ndarray | None = None
+        rel_err = 0.0
+
+        if (
+            self._use_priv_grasp
+            and priv_geom is not None
+            and left_finger_force12 is not None
+            and self.phase
+            in (PipelinePhase.COMPLIANT_SEARCH, PipelinePhase.COMPLIANT_INSERT)
+        ):
+            po = self.priv_grasp.step(priv_geom, finger_force12, left_finger_force12)
+            delta_hand = po.delta_right_hand16
+            delta_left_hand = po.delta_left_hand16
+            rel_err = float(po.rel_rot_err_rad)
+        else:
+            # Deployable path: dual fingertip force admittance (no object pose).
+            delta_hand = self.fingers.step(finger_force12, hold)
+            if self._hold_left_hand16 is not None and left_finger_force12 is not None:
+                delta_left_hand = self.fingers_left.step(
+                    left_finger_force12, self._hold_left_hand16
+                )
+            else:
+                delta_left_hand = None
 
         if self.phase == PipelinePhase.COMPLIANT_SEARCH:
             sr: SearchStepResult = self._call_controller_step(
-                self.search, frame, wrench_right6, wrist_xyz
+                self.search,
+                frame,
+                wrench_right6,
+                wrist_xyz,
+                extra={
+                    "priv_lat_m": priv_lat_m,
+                    "priv_along_m": priv_along_m,
+                    "priv_lat_vec": priv_lat_vec,
+                },
             )
             self._remember_delta(sr.delta_xyz)
             if sr.done:
@@ -163,14 +229,36 @@ class InsertPipeline:
                     self.insert.reset(frame, wrench_right6, wrist_xyz)
                     self._prev_delta_xyz = np.zeros(3, dtype=np.float64)
                     return PipelineStepResult(
-                        self.phase, False, False, sr.reason, np.zeros(3), delta_hand
+                        self.phase,
+                        False,
+                        False,
+                        sr.reason,
+                        np.zeros(3),
+                        delta_hand,
+                        delta_left_hand16=delta_left_hand,
+                        priv_rel_rot_err_rad=rel_err,
                     )
                 self.phase = PipelinePhase.DONE
                 return PipelineStepResult(
-                    PipelinePhase.DONE, True, False, sr.reason, sr.delta_xyz, delta_hand
+                    PipelinePhase.DONE,
+                    True,
+                    False,
+                    sr.reason,
+                    sr.delta_xyz,
+                    delta_hand,
+                    delta_left_hand16=delta_left_hand,
+                    priv_rel_rot_err_rad=rel_err,
                 )
             return PipelineStepResult(
-                PipelinePhase.COMPLIANT_SEARCH, False, False, sr.reason, sr.delta_xyz, delta_hand
+                PipelinePhase.COMPLIANT_SEARCH,
+                False,
+                False,
+                sr.reason,
+                sr.delta_xyz,
+                delta_hand,
+                delta_left_xyz=getattr(sr, "delta_left_xyz", None),
+                delta_left_hand16=delta_left_hand,
+                priv_rel_rot_err_rad=rel_err,
             )
 
         if self.phase in (PipelinePhase.COMPLIANT_INSERT, PipelinePhase.RELEASE):
@@ -189,9 +277,25 @@ class InsertPipeline:
             finger_open = ir.finger_open
             if finger_open > 0.0:
                 delta_hand = np.zeros(16, dtype=np.float64)
+                delta_left_hand = (
+                    np.zeros(16, dtype=np.float64) if delta_left_hand is not None else None
+                )
 
             if not ir.done and ir.reason == "retreat":
                 self._remember_delta(ir.delta_xyz)
+                near = priv_lat_m is not None and float(priv_lat_m) <= 0.010
+                if near:
+                    return PipelineStepResult(
+                        PipelinePhase.COMPLIANT_INSERT,
+                        False,
+                        False,
+                        "soft_retreat_near_hole",
+                        ir.delta_xyz,
+                        delta_hand,
+                        delta_left_xyz=getattr(ir, "delta_left_xyz", None),
+                        delta_left_hand16=delta_left_hand,
+                        priv_rel_rot_err_rad=rel_err,
+                    )
                 if self._jam_recoveries < self.pipeline_config.max_jam_recoveries:
                     self._jam_recoveries += 1
                     self._recover_to_search(wrench_right6, wrist_xyz)
@@ -202,6 +306,9 @@ class InsertPipeline:
                         f"jam_recover_{self._jam_recoveries}",
                         ir.delta_xyz,
                         delta_hand,
+                        delta_left_xyz=getattr(ir, "delta_left_xyz", None),
+                        delta_left_hand16=delta_left_hand,
+                        priv_rel_rot_err_rad=rel_err,
                     )
                 self.phase = PipelinePhase.DONE
                 return PipelineStepResult(
@@ -211,6 +318,9 @@ class InsertPipeline:
                     "jam_recovery_exhausted",
                     ir.delta_xyz,
                     delta_hand,
+                    delta_left_xyz=getattr(ir, "delta_left_xyz", None),
+                    delta_left_hand16=delta_left_hand,
+                    priv_rel_rot_err_rad=rel_err,
                 )
 
             self._remember_delta(ir.delta_xyz)
@@ -223,8 +333,18 @@ class InsertPipeline:
                 ir.delta_xyz,
                 delta_hand,
                 finger_open=finger_open,
+                delta_left_xyz=getattr(ir, "delta_left_xyz", None),
+                delta_left_hand16=delta_left_hand,
+                priv_rel_rot_err_rad=rel_err,
             )
 
         return PipelineStepResult(
-            PipelinePhase.DONE, True, False, "already_done", np.zeros(3), delta_hand
+            PipelinePhase.DONE,
+            True,
+            False,
+            "already_done",
+            np.zeros(3),
+            delta_hand,
+            delta_left_hand16=delta_left_hand,
+            priv_rel_rot_err_rad=rel_err,
         )
