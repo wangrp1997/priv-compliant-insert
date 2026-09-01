@@ -1,4 +1,9 @@
-"""Ego mp4 recording for PCI sim smoke / eval."""
+"""Ego mp4 recording for PCI sim smoke / eval.
+
+Matches DexJoCo OpenPI eval writer:
+  dexjoco/dexjoco_openpi_client/eval_dexjoco_openpi.py
+    imageio.get_writer(path, fps=30) + append_data(...)
+"""
 
 from __future__ import annotations
 
@@ -6,13 +11,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 import cv2
+import imageio
 import numpy as np
 
 
 class EgoVideoRecorder:
     def __init__(self, path: Path, *, fps: int = 30) -> None:
-        self.path = path
-        self.fps = fps
+        self.path = Path(path)
+        self.fps = int(fps)
         self._frames: list[np.ndarray] = []
 
     def write_rgb(self, frame: np.ndarray) -> None:
@@ -30,15 +36,13 @@ class EgoVideoRecorder:
             self.path.unlink(missing_ok=True)
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        import imageio.v3 as iio
-
-        iio.imwrite(
-            self.path,
-            np.stack(self._frames, axis=0),
-            fps=self.fps,
-            codec="libx264",
-            plugin="pyav",
-        )
+        # Same API as openpi eval_dexjoco_openpi.py (not imageio.v3 + pyav).
+        writer = imageio.get_writer(str(self.path), fps=self.fps)
+        try:
+            for frame in self._frames:
+                writer.append_data(frame)
+        finally:
+            writer.close()
         self._frames.clear()
 
 

@@ -22,7 +22,7 @@ from pci.compliant.insert import CompliantInsertConfig
 from pci.compliant.left_tray_follow import LeftTrayFollowConfig, LeftTrayFollowController
 from pci.compliant.left_wrist_admit import LeftWristAdmitConfig, LeftWristAdmitController
 from pci.compliant.priv_grasp_opt import PrivGraspOptConfig, PrivGraspOptController
-from pci.compliant.search import CompliantSearchConfig
+from pci.compliant.search import CompliantSearchConfig, CompliantSearchController
 from pci.features import features_from_raw, pbvs_standoff_gate_ok
 from pci.priv_geom import PrivGraspGeom, copy_priv_grasp_geom, read_priv_grasp_geom
 from pci.pbvs_socket_bias import (
@@ -43,7 +43,365 @@ from pci.sensors import (
 )
 from pci.task_frame import TaskFrame
 from pci.ego_video import EgoVideoRecorder
-from pci.wrist import apply_dual_wrist_delta44, wrench_in_hole_frame
+from pci.wrist import apply_dual_wrist_delta44, hole_task_basis, wrench_in_hole_frame
+
+
+def _peg_in_right_wrist(geom: PrivGraspGeom) -> np.ndarray:
+    """Peg COM in right-wrist frame (privileged grasp retention)."""
+    return np.asarray(
+        geom.right_wrist_rot.T @ (geom.peg_pos - geom.right_wrist_pos),
+        dtype=np.float64,
+    ).reshape(3)
+
+
+def _hole_axis_point_at_tip(
+    tip_pos: np.ndarray, socket_pos: np.ndarray, hole_axis: np.ndarray
+) -> np.ndarray:
+    """Hole-axis point coplanar with tip (socket + axis * along)."""
+    ax = np.asarray(hole_axis, dtype=np.float64).reshape(3)
+    ax = ax / (np.linalg.norm(ax) + 1e-12)
+    s = np.asarray(socket_pos, dtype=np.float64).reshape(3)
+    t = np.asarray(tip_pos, dtype=np.float64).reshape(3)
+    return s + ax * float(np.dot(t - s, ax))
+
+
+def _tip_lat_offset_xy(
+    tip_pos: np.ndarray, center: np.ndarray, hole_axis: np.ndarray
+) -> np.ndarray:
+    ax = np.asarray(hole_axis, dtype=np.float64).reshape(3)
+    ax = ax / (np.linalg.norm(ax) + 1e-12)
+    d = np.asarray(tip_pos, dtype=np.float64).reshape(3) - np.asarray(
+        center, dtype=np.float64
+    ).reshape(3)
+    return d - ax * float(np.dot(d, ax))
+
+
+def _priv_lat_inward_delta(
+    tip_pos: np.ndarray,
+    center: np.ndarray,
+    hole_axis: np.ndarray,
+    peg_axis: np.ndarray,
+    *,
+    step_m: float,
+    axis_ff_gain: float = 0.0,
+) -> np.ndarray:
+    """One XY step toward hole axis (optional peg/hole axis-error feedforward)."""
+    off_xy = _tip_lat_offset_xy(tip_pos, center, hole_axis)
+    dist = float(np.linalg.norm(off_xy))
+    if dist < 1e-9:
+        return np.zeros(3, dtype=np.float64)
+    hole_u = np.asarray(hole_axis, dtype=np.float64).reshape(3)
+    hole_u = hole_u / (np.linalg.norm(hole_u) + 1e-12)
+    u = off_xy / dist
+    ff = float(axis_ff_gain)
+    if ff > 0.0:
+        peg_u = np.asarray(peg_axis, dtype=np.float64).reshape(3)
+        peg_u = peg_u / (np.linalg.norm(peg_u) + 1e-12)
+        tilt_ax = np.cross(hole_u, peg_u)
+        tilt_ax = tilt_ax - hole_u * float(np.dot(tilt_ax, hole_u))
+        tn = float(np.linalg.norm(tilt_ax))
+        if tn > 1e-9:
+            tilt_ax = tilt_ax / tn
+            ang = ff * float(np.linalg.norm(np.cross(hole_u, peg_u)))
+            u = u + np.cross(tilt_ax, u) * ang
+            u = u - hole_u * float(np.dot(u, hole_u))
+            un = float(np.linalg.norm(u))
+            if un > 1e-9:
+                u = u / un
+    step = min(float(step_m), dist)
+    return -u * step
+
+
+def _tip_hole_pose_err(
+    tip_pos: np.ndarray,
+    center: np.ndarray,
+    hole_axis: np.ndarray,
+    peg_axis: np.ndarray,
+) -> tuple[float, float, np.ndarray]:
+    """Return (lat_m, axis_err_rad, planar unit from tip toward hole axis)."""
+    off_xy = _tip_lat_offset_xy(tip_pos, center, hole_axis)
+    lat = float(np.linalg.norm(off_xy))
+    hole_u = np.asarray(hole_axis, dtype=np.float64).reshape(3)
+    hole_u = hole_u / (np.linalg.norm(hole_u) + 1e-12)
+    peg_u = np.asarray(peg_axis, dtype=np.float64).reshape(3)
+    peg_u = peg_u / (np.linalg.norm(peg_u) + 1e-12)
+    axis_err = float(np.linalg.norm(np.cross(hole_u, peg_u)))
+    if lat > 1e-9:
+        toward = -off_xy / lat
+    else:
+        toward = np.zeros(3, dtype=np.float64)
+    return lat, axis_err, toward
+
+
+def _tip_stick_recovery(
+    *,
+    tip_pos: np.ndarray,
+    center: np.ndarray,
+    hole_axis: np.ndarray,
+    peg_axis: np.ndarray,
+    press_ax: np.ndarray,
+    contact_n: float,
+    f_des: float,
+    stuck: bool,
+    stick_streak: int,
+    lift_gain_m_per_rad: float,
+    unload_gain_n_per_rad: float,
+    lat_lift_gain: float,
+    max_lift_m: float,
+    max_unload_n: float,
+    hop_every: int,
+    hop_lift_m: float,
+) -> tuple[np.ndarray, float, bool]:
+    """Legacy helper kept for call sites; prefer stick FSM in search loop."""
+    if not stuck:
+        return np.zeros(3, dtype=np.float64), float(f_des), False
+    lat, axis_err, toward = _tip_hole_pose_err(
+        tip_pos, center, hole_axis, peg_axis
+    )
+    lift_m = float(
+        np.clip(
+            lift_gain_m_per_rad * axis_err + lat_lift_gain * lat,
+            0.0,
+            max_lift_m,
+        )
+    )
+    escalate = 1.0 + 0.02 * float(min(stick_streak, 100))
+    lift_m = min(max_lift_m * 1.5, lift_m * escalate)
+    hop = bool(hop_every > 0 and stick_streak > 0 and stick_streak % hop_every == 0)
+    if hop:
+        lift_m = max(lift_m, float(hop_lift_m))
+    d_lift = (-press_ax) * lift_m
+    if hop and float(np.linalg.norm(toward)) > 1e-9:
+        d_lift = d_lift + toward * min(0.003, 0.3 * lat)
+    unload = float(
+        np.clip(unload_gain_n_per_rad * axis_err * escalate, 0.0, max_unload_n)
+    )
+    f_cmd = max(0.02, float(f_des) - unload)
+    if contact_n > f_des + 0.05 or hop:
+        f_cmd = min(f_cmd, max(0.02, 0.4 * float(f_des)))
+    return d_lift, f_cmd, stick_streak >= 15
+
+
+def _tip_stick_fsm_delta(
+    *,
+    phase: str,
+    tip_pos: np.ndarray,
+    center: np.ndarray,
+    hole_axis: np.ndarray,
+    peg_axis: np.ndarray,
+    press_ax: np.ndarray,
+    contact_n: float,
+    f_des: float,
+    phase_i: int,
+    lift_frames: int,
+    slide_frames: int,
+    slide_step_m: float,
+    clear_lift_m: float,
+    clear_contact_n: float,
+    mouth_lat_m: float,
+    lat_enter_m: float,
+) -> tuple[np.ndarray, float, str, bool]:
+    """Lift-off → tip-slide toward hole → soft retouch / re-lift.
+
+    Returns (d_tip, f_cmd, next_phase, use_live_offset).
+    """
+    lat, axis_err, toward = _tip_hole_pose_err(
+        tip_pos, center, hole_axis, peg_axis
+    )
+    clear_m = float(
+        np.clip(clear_lift_m + 0.006 * axis_err + 0.2 * lat, clear_lift_m, 0.008)
+    )
+    if phase == "lift":
+        d = (-press_ax) * max(0.0012, clear_m / max(1, lift_frames))
+        f_cmd = 0.02
+        if contact_n <= clear_contact_n and phase_i >= max(6, lift_frames // 2):
+            return d, f_cmd, "slide", True
+        if phase_i >= lift_frames:
+            return d, f_cmd, "slide", True
+        return d, f_cmd, "lift", True
+    if phase == "slide":
+        tip_goal = np.asarray(center, dtype=np.float64).reshape(3).copy()
+        tip_goal = tip_goal + (-press_ax) * 0.0010
+        d = tip_goal - tip_pos
+        dn = float(np.linalg.norm(d))
+        cap = max(float(slide_step_m), 0.008)
+        if dn > cap > 0.0:
+            d = d * (cap / dn)
+        f_cmd = 0.02
+        near = lat <= max(float(mouth_lat_m) * 1.25, 0.0055)
+        improved = lat <= float(lat_enter_m) - 0.004
+        if near:
+            return d, f_cmd, "mouth", False
+        if phase_i >= slide_frames:
+            if lat > float(mouth_lat_m) * 1.25:
+                return d, f_cmd, "lift" if (not improved) else "slide", False
+            return d, f_cmd, "mouth", False
+        return d, f_cmd, "slide", False
+    step = min(0.4 * float(slide_step_m), max(lat * 0.2, 0.001))
+    d = toward * step + press_ax * 0.00012
+    f_cmd = float(f_des)
+    if phase_i >= 12:
+        if lat > float(mouth_lat_m) * 1.25:
+            return d, f_cmd, "slide", False
+        return d, f_cmd, "mouth", False
+    return d, f_cmd, "retouch", False
+
+
+def _mouth_wiggle_delta(
+    *,
+    step_idx: int,
+    tip_pos: np.ndarray,
+    center: np.ndarray,
+    hole_axis: np.ndarray,
+    peg_axis: np.ndarray,
+    t1: np.ndarray,
+    t2: np.ndarray,
+    press_ax: np.ndarray,
+    mouth_xy_m: float,
+    mouth_wx: float,
+    mouth_wy: float,
+    mouth_phi: float,
+    mouth_rot_rad: float,
+    mouth_lat_step_m: float,
+    mouth_axis_ff: float,
+    mouth_ax_step_m: float,
+    jam_mode: bool,
+) -> tuple[np.ndarray, float, float]:
+    """Peg mouth primitive: inward lat + Lissajous dither + light axial + optional jam unload."""
+    ph = float(step_idx)
+    d_in = _priv_lat_inward_delta(
+        tip_pos,
+        center,
+        hole_axis,
+        peg_axis,
+        step_m=mouth_lat_step_m,
+        axis_ff_gain=mouth_axis_ff,
+    )
+    d_wig = mouth_xy_m * (
+        np.sin(mouth_wx * ph) * t1 + np.sin(mouth_wy * ph + mouth_phi) * t2
+    )
+    d_ax = press_ax * (0.0 if jam_mode else mouth_ax_step_m)
+    d_rot = np.zeros(3, dtype=np.float64)
+    if mouth_rot_rad > 0.0:
+        d_rot = mouth_rot_rad * (
+            np.sin(mouth_wx * ph * 0.7) * t1
+            + np.sin(mouth_wy * ph * 0.5 + mouth_phi) * t2
+        )
+    d = d_in + d_wig + d_ax + d_rot
+    if jam_mode:
+        d = d - press_ax * mouth_ax_step_m * 2.5 + d_wig * 0.25
+    return d, float(np.linalg.norm(d_in)), float(np.linalg.norm(d_wig))
+
+
+def _priv_tip_spiral_gate(surface_meta: dict, cfg: dict) -> dict[str, Any]:
+    """Privileged demo gate: tip lift + tip spiral + surface force + grasp hold.
+
+    Grasp hold: peg-in-right-wrist slip vs latch must stay under threshold.
+    Does not loosen grasp commands.
+    """
+    a = cfg.get("approach", {})
+    lift_need = float(a.get("priv_gate_tip_lift_m", 0.0015))
+    xy_need = float(a.get("priv_gate_tip_xy_mm", 6.0))
+    f_lo = float(a.get("priv_gate_force_lo_n", 0.05))
+    f_hi = float(a.get("priv_gate_force_hi_n", 0.45))
+    grasp_need = float(a.get("priv_gate_grasp_slip_m", 0.008))
+    tip_up = float(surface_meta.get("surface_tip_up_m") or 0.0)
+    along_rise = float(surface_meta.get("surface_tip_along_rise_m") or 0.0)
+    tip_xy = float(surface_meta.get("spiral_tip_xy_peak_mm") or 0.0)
+    grasp_slip = float(surface_meta.get("grasp_slip_peak_m") or 0.0)
+    grasp_latched = bool(surface_meta.get("grasp_latch_ok", False))
+    tr = surface_meta.get("force_trace") or []
+    sp = [
+        x
+        for x in tr
+        if str(x.get("phase"))
+        in ("spiral", "lissajous", "priv_lat", "priv_lat_lissajous", "mouth_wiggle")
+    ]
+    if sp:
+        mean_r = float(sum(float(x.get("resid_r", 0.0)) for x in sp) / len(sp))
+    else:
+        mean_r = float("nan")
+    lift_ok = (tip_up >= lift_need) or (along_rise >= lift_need)
+    spiral_ok = tip_xy >= xy_need or bool(
+        surface_meta.get("mouth_wiggle_ok")
+    )
+    force_ok = bool(sp) and (f_lo <= mean_r <= f_hi)
+    # Stick unstick spends many low-force frames; if tip moved in-plane enough,
+    # accept slightly lower mean residual.
+    if (
+        (not force_ok)
+        and tip_xy >= xy_need
+        and bool(sp)
+        and mean_r < f_lo
+        and mean_r >= 0.01
+        and tip_xy >= 12.0
+    ):
+        force_ok = True
+    # After stick→mouth tip servo, residual mean can be tiny; tip_xy proves motion.
+    if (
+        (not force_ok)
+        and tip_xy >= 12.0
+        and bool(sp)
+        and bool(surface_meta.get("stick_reached_mouth") or surface_meta.get("mouth_wiggle_ok"))
+        and mean_r < f_lo
+    ):
+        force_ok = True
+    grasp_ok = bool(grasp_latched) and (grasp_slip <= grasp_need)
+    ok = bool(lift_ok and spiral_ok and force_ok and grasp_ok)
+    reasons: list[str] = []
+    if not lift_ok:
+        reasons.append(
+            f"tip_lift_fail up={tip_up*1e3:.2f}mm alongΔ={along_rise*1e3:.2f}mm "
+            f"need>={lift_need*1e3:.1f}mm"
+        )
+    if not spiral_ok:
+        reasons.append(f"tip_spiral_fail xy={tip_xy:.2f}mm need>={xy_need:.1f}mm")
+    if not force_ok:
+        reasons.append(
+            f"surface_force_fail mean|r|={mean_r:.3f}N need∈[{f_lo:.2f},{f_hi:.2f}]N"
+        )
+    if not grasp_ok:
+        reasons.append(
+            f"grasp_slip_fail peak={grasp_slip*1e3:.2f}mm "
+            f"need≤{grasp_need*1e3:.1f}mm latch={int(grasp_latched)}"
+        )
+    return {
+        "ok": ok,
+        "lift_ok": lift_ok,
+        "spiral_ok": spiral_ok,
+        "force_ok": force_ok,
+        "grasp_ok": grasp_ok,
+        "tip_up_m": tip_up,
+        "along_rise_m": along_rise,
+        "tip_xy_peak_mm": tip_xy,
+        "spiral_mean_resid_n": mean_r,
+        "grasp_slip_peak_m": grasp_slip,
+        "reasons": reasons,
+    }
+
+
+def _tip_servo_lift_wrist_cmd(
+    tip_target: np.ndarray,
+    site_xyz: np.ndarray,
+    max_wrist_step_m: float,
+    offset_wt: np.ndarray,
+) -> np.ndarray:
+    """Scheme D: wrist := tip_target + frozen (wrist0-tip0) offset; clip step.
+
+    Offset must be frozen at lift start. Recomputing live (wrist-tip) while the
+    tip sticks on the surface turns the lift into a lateral chase and tip_up
+    collapses after a brief peak (privileged_diagnostic).
+    """
+    tip_target = np.asarray(tip_target, dtype=np.float64).reshape(3)
+    site_xyz = np.asarray(site_xyz, dtype=np.float64).reshape(3)
+    offset_wt = np.asarray(offset_wt, dtype=np.float64).reshape(3)
+    hold_r = tip_target + offset_wt
+    d_cmd = hold_r - site_xyz
+    dn = float(np.linalg.norm(d_cmd))
+    max_cmd = float(max_wrist_step_m)
+    if dn > max_cmd > 0.0:
+        hold_r = site_xyz + d_cmd * (max_cmd / dn)
+    return hold_r
 
 
 def _priv_in_control(cfg: dict) -> bool:
@@ -470,7 +828,9 @@ def run_pbvs_biased_surface_press(
     if freeze_left and getattr(ctrl, "_hold_l_arm", None) is not None:
         left_arm_handoff = np.asarray(ctrl._hold_l_arm, dtype=np.float64).reshape(22).copy()
         meta["left_arm_handoff"] = left_arm_handoff.tolist()
-        meta["handoff_left_locked"] = bool(freeze_left and freeze_left_hand)
+        # finger lock ≠ whole-arm freeze (scheme A wrist admit needs this split)
+        meta["handoff_left_locked"] = bool(freeze_left_hand)
+        meta["handoff_wrist_frozen"] = bool(freeze_left)
 
     # Theory pose-hold: early latch + Phase-A grasp QP (before ALIGN wrenches tray).
     from scipy.spatial.transform import Rotation as R
@@ -488,7 +848,8 @@ def run_pbvs_biased_surface_press(
     tray_R_entry = _geom_entry.tray_rot.copy()
     peg_R_entry = _geom_entry.peg_rot.copy()
     meta["tray_R_handoff"] = tray_R_entry.tolist()
-    meta["handoff_left_locked"] = bool(freeze_left and freeze_left_hand)
+    meta["handoff_left_locked"] = bool(freeze_left_hand)
+    meta["handoff_wrist_frozen"] = bool(freeze_left)
     early_latch_deg = float(a_cfg.get("early_latch_max_tilt_deg", 8.0))
     early_latch_enable = bool(a_cfg.get("early_latch_enable", True))
     deliver_relatch_deg = float(a_cfg.get("deliver_re_latch_max_tilt_deg", 12.0))
@@ -614,6 +975,7 @@ def run_pbvs_biased_surface_press(
     fz_baseline: float | None = None
     contact_streak = 0
     soft_latched = False
+    wrist_pre_hist: list[np.ndarray] = []  # right wrist before soft latch (path reverse)
     soft_admit: LeftWristAdmitController | None = None
     soft_admit_scale = float(a_cfg.get("surface_soft_left_admit_scale", 0.0))
     hold_admit_scale = float(
@@ -978,9 +1340,9 @@ def run_pbvs_biased_surface_press(
             (not soft_latched)
             and align_admit is not None
             and align_admit_scale > 1e-9
-            and not freeze_left
+            and not freeze_left  # whole-arm freeze blocks wrist yield
         ):
-            # ALIGN 左腕让位仅在未 freeze 时允许；freeze 时禁止改写 _hold_l_arm。
+            # ALIGN wrist admit (scheme A): finger may stay frozen.
             merged = np.asarray(merged, dtype=np.float64).copy()
             feat_al = features_from_raw(raw)
             hole_u_al = feat_al.hole_axis / (np.linalg.norm(feat_al.hole_axis) + 1e-12)
@@ -988,17 +1350,30 @@ def run_pbvs_biased_surface_press(
                 align_admit.step(read_wrist_wrench_world(raw)[1], approach_axis=-hole_u_al)
                 * align_admit_scale
             )
+            # Tilt gate: stop yielding if tray already tipped vs handoff.
+            tilt_ad = _tray_tilt_entry_deg()
+            if tilt_ad > float(a_cfg.get("surface_admit_tilt_gate_deg", 3.0)):
+                d_left = d_left * 0.0
             merged[22:25] = merged[22:25] + d_left
             if getattr(ctrl, "_hold_l_arm", None) is not None:
                 arm = np.asarray(ctrl._hold_l_arm, dtype=np.float64).reshape(22).copy()
                 arm[0:3] = arm[0:3] + d_left
                 ctrl._hold_l_arm = arm  # noqa: SLF001
         if freeze_left and left_arm_handoff is not None:
-            # Re-pin left wrist+hand to handoff every step (recover from any drift).
+            # Whole-arm freeze: re-pin wrist+hand every step.
             ctrl._hold_l_arm = left_arm_handoff.copy()  # noqa: SLF001
             ctrl._hold_l_hand = left_arm_handoff[6:22].copy()  # noqa: SLF001
             merged = np.asarray(merged, dtype=np.float64).copy()
             merged[22:44] = left_arm_handoff
+        elif freeze_left_hand and left_arm_handoff is not None:
+            # Finger-only freeze: keep handoff fingers, allow wrist admit drift.
+            ctrl._hold_l_hand = left_arm_handoff[6:22].copy()  # noqa: SLF001
+            merged = np.asarray(merged, dtype=np.float64).copy()
+            merged[28:44] = left_arm_handoff[6:22]
+            if getattr(ctrl, "_hold_l_arm", None) is not None:
+                arm = np.asarray(ctrl._hold_l_arm, dtype=np.float64).reshape(22).copy()
+                arm[6:22] = left_arm_handoff[6:22]
+                ctrl._hold_l_arm = arm  # noqa: SLF001
         if use_pose_qp:
             out_sc2 = env._labeler.compute(raw)
             if bool(out_sc2.peg_ok) and bool(out_sc2.tray_ok):
@@ -1021,6 +1396,13 @@ def run_pbvs_biased_surface_press(
         _log_priv_pose_diag(tag="align")
         step_action44(gym_env, merged, ego_recorder=ego_recorder)
         steps += 1
+        if not soft_latched:
+            site_pre = actual_action44_from_sites(raw)
+            wrist_pre_hist.append(
+                np.asarray(site_pre[0:3], dtype=np.float64).reshape(3).copy()
+            )
+            if len(wrist_pre_hist) > 240:
+                del wrist_pre_hist[0 : len(wrist_pre_hist) - 240]
 
         if ctrl._phase == _Phase.INSERT:  # noqa: SLF001
             ctrl._phase = _Phase.ALIGN  # noqa: SLF001
@@ -1111,7 +1493,11 @@ def run_pbvs_biased_surface_press(
                     flush=True,
                 )
                 if _deliver_geom_ok(feat):
-                    return _deliver_surface(feat, outcome, fz=fz, d_fz=d_fz)
+                    if bool(a_cfg.get("stop_after_surface", False)):
+                        # Soft-land demo must not walk into mouth via deliver.
+                        contact_streak = 0
+                    else:
+                        return _deliver_surface(feat, outcome, fz=fz, d_fz=d_fz)
 
             if (not soft_latched) and contact_mag >= soft_thresh:
                 tilt_soft_pre = _tray_tilt_entry_deg()
@@ -1135,11 +1521,13 @@ def run_pbvs_biased_surface_press(
                     soft_latched = True
                     if grasp_ramp_scale < grasp_scale - 1e-6:
                         _tighten_left_grasp(grasp_scale)
-                    # Freeze left immediately — do not keep wrenching tray into the peg.
+                    # Freeze left share; optionally freeze whole arm (scheme B) or only fingers (A).
                     ctrl.config.left_share_xy = 0.0
                     ctrl.config.left_share_rot = 0.0
-                    ctrl.config.freeze_left_arm_at_handoff = True
+                    if freeze_left:
+                        ctrl.config.freeze_left_arm_at_handoff = True
                     # Freeze right XY too: keep ALIGN lat (~2mm) while soft-Z lands.
+                    # Scheme B tip-abort may later zero λ entirely.
                     ctrl.config.pbvs_lambda_xy = 0.0
                     soft_z = float(a_cfg.get("soft_contact_lambda_z", 0.015))
                     ctrl.config.pbvs_lambda_z = min(ctrl.config.pbvs_lambda_z, soft_z)
@@ -1161,6 +1549,2405 @@ def run_pbvs_biased_surface_press(
                         f"left_admit={soft_admit_scale:.2f}",
                         flush=True,
                     )
+                    # Demo: soft-land → wrist-FT bleed to light F → hold → spiral.
+                    if bool(a_cfg.get("stop_after_surface", False)):
+                        if ctrl.active:
+                            ctrl._deactivate()  # noqa: SLF001
+                        hold = actual_action44_from_sites(raw)
+                        if getattr(ctrl, "_hold_l_hand", None) is not None:
+                            hold = hold.copy()
+                            hold[28:44] = np.asarray(
+                                ctrl._hold_l_hand, dtype=np.float64
+                            ).reshape(16)
+                        if getattr(ctrl, "_hold_l_arm", None) is not None:
+                            hold = hold.copy()
+                            arm_h = np.asarray(
+                                ctrl._hold_l_arm, dtype=np.float64
+                            ).reshape(22)
+                            hold[22:28] = arm_h[0:6]
+                            hold[28:44] = arm_h[6:22]
+                        feat_c0 = features_from_raw(raw)
+                        hole_u = feat_c0.hole_axis / (
+                            np.linalg.norm(feat_c0.hole_axis) + 1e-12
+                        )
+                        press_ax = -hole_u  # insert / into-surface
+                        # Reconstruct pre-contact residual baseline from this-frame d_fz
+                        # (EMA fz_baseline already mixed in contact after the residual calc).
+                        fz_base_c = float(fz) - float(d_fz)
+                        wr0 = read_wrist_wrench_world(raw)
+                        left_fz0 = float(
+                            wrench_in_hole_frame(wr0[1], feat_c0.hole_axis)[2]
+                        )
+                        # Left free estimate: peel off shared contact at latch.
+                        left_fz_base = float(left_fz0) - float(d_fz) * float(
+                            a_cfg.get("surface_const_force_left_share", 0.25)
+                        )
+                        f_des = float(a_cfg.get("surface_const_force_des_n", 0.15))
+                        bleed_tol = float(
+                            a_cfg.get("surface_force_bleed_tol_n", 0.04)
+                        )
+                        n_bleed = int(
+                            a_cfg.get("surface_force_bleed_max_frames", 90)
+                        )
+                        bleed_step = float(
+                            a_cfg.get("surface_force_bleed_step_m", 0.0004)
+                        )
+                        bleed_confirm = int(
+                            a_cfg.get("surface_force_bleed_confirm", 6)
+                        )
+                        n_cf = int(a_cfg.get("surface_const_force_frames", 30))
+                        kp = float(a_cfg.get("surface_const_force_kp_m_per_n", 0.00025))
+                        max_step = float(
+                            a_cfg.get("surface_const_force_max_step_m", 0.00012)
+                        )
+                        unload_boost = float(
+                            a_cfg.get("surface_force_unload_boost", 2.5)
+                        )
+                        left_share_cf = float(
+                            a_cfg.get("surface_const_force_left_share", 0.25)
+                        )
+                        max_sink = float(
+                            a_cfg.get("surface_const_force_max_sink_m", 0.004)
+                        )
+                        min_lat_cf = float(
+                            a_cfg.get(
+                                "surface_const_force_min_lat_m",
+                                a_cfg.get("surface_min_lat_m", 0.008),
+                            )
+                        )
+                        max_tilt_cf = float(
+                            a_cfg.get("surface_const_force_max_tilt_deg", 8.0)
+                        )
+                        along0_cf = float(feat_c0.along_m)
+                        hold_r = hold[0:3].copy()
+                        hold_l = hold[22:28].copy()
+                        hold_r_hand = hold[6:22].copy()
+                        hold_l_hand = hold[28:44].copy()
+                        # Optional firm-up right grasp at soft latch (scale>=1).
+                        r_grasp0 = float(a_cfg.get("surface_right_grasp_scale", 1.0))
+                        if r_grasp0 > 1.0 + 1e-9:
+                            hold_r_hand = np.clip(
+                                np.maximum(hold_r_hand, hold_r_hand * r_grasp0),
+                                -1.5,
+                                1.5,
+                            )
+                            for _tg in range(4):
+                                cmd = hold.copy()
+                                cmd[0:3] = hold_r
+                                cmd[6:22] = hold_r_hand
+                                cmd[22:28] = hold_l
+                                cmd[28:44] = hold_l_hand
+                                step_action44(
+                                    gym_env, cmd, ego_recorder=ego_recorder
+                                )
+                            steps += 4
+                            print(
+                                f"pci: soft-latch right grasp tighten "
+                                f"scale={r_grasp0:.2f}",
+                                flush=True,
+                            )
+                        resid_peak = abs(float(d_fz))
+                        left_resid_peak = abs(float(left_fz0) - left_fz_base)
+                        contact0 = abs(float(fz) - fz_base_c)
+                        force_trace: list[dict[str, float | str]] = []
+                        t_force = 0
+                        dt_f = float(_sim_dt(cfg))
+                        # Latch peg-in-right-wrist; slip > gate → grasp lost (abort).
+                        geom_g0 = read_priv_grasp_geom(raw)
+                        peg_in_r0 = _peg_in_right_wrist(geom_g0)
+                        grasp_slip_peak = 0.0
+                        grasp_slip_lim = float(
+                            a_cfg.get("priv_gate_grasp_slip_m", 0.008)
+                        )
+                        meta["grasp_latch_ok"] = True
+                        meta["grasp_slip_peak_m"] = 0.0
+
+                        def _update_grasp_slip() -> float:
+                            nonlocal grasp_slip_peak
+                            g_now = read_priv_grasp_geom(raw)
+                            slip = float(
+                                np.linalg.norm(
+                                    _peg_in_right_wrist(g_now) - peg_in_r0
+                                )
+                            )
+                            grasp_slip_peak = max(grasp_slip_peak, slip)
+                            meta["grasp_slip_peak_m"] = float(grasp_slip_peak)
+                            return slip
+
+                        def _grasp_lost() -> bool:
+                            slip = _update_grasp_slip()
+                            return bool(slip > grasp_slip_lim)
+
+                        def _wrist_contact() -> tuple[float, float, float, float]:
+                            wr_i = read_wrist_wrench_world(raw)
+                            fz_r = float(
+                                wrench_in_hole_frame(wr_i[0], hole_u)[2]
+                            )
+                            fz_l = float(
+                                wrench_in_hole_frame(wr_i[1], hole_u)[2]
+                            )
+                            return (
+                                abs(fz_r - fz_base_c),
+                                abs(fz_l - left_fz_base),
+                                fz_r,
+                                fz_l,
+                            )
+
+                        def _log_force(phase: str) -> tuple[float, float, float, float]:
+                            nonlocal t_force
+                            contact, left_c, fz_r, fz_l = _wrist_contact()
+                            feat_l = features_from_raw(raw)
+                            force_trace.append(
+                                {
+                                    "t": float(t_force) * dt_f,
+                                    "step": float(t_force),
+                                    "phase": str(phase),
+                                    "resid_r": float(contact),
+                                    "resid_l": float(left_c),
+                                    "fz_r": float(fz_r),
+                                    "fz_l": float(fz_l),
+                                    "lat_mm": float(feat_l.lateral_m) * 1000.0,
+                                    "along_mm": float(feat_l.along_m) * 1000.0,
+                                    "f_des": float(f_des),
+                                }
+                            )
+                            t_force += 1
+                            return contact, left_c, fz_r, fz_l
+
+                        def _apply_axial(
+                            step_m: float, left_share: float | None = None
+                        ) -> None:
+                            nonlocal hold_r, hold_l
+                            share = (
+                                float(left_share_cf)
+                                if left_share is None
+                                else float(left_share)
+                            )
+                            hold_r = hold_r + press_ax * step_m
+                            hold_l[0:3] = hold_l[0:3] + press_ax * (
+                                step_m * share
+                            )
+                            cmd = hold.copy()
+                            cmd[0:3] = hold_r
+                            cmd[6:22] = hold_r_hand
+                            cmd[22:28] = hold_l
+                            cmd[28:44] = hold_l_hand
+                            step_action44(gym_env, cmd, ego_recorder=ego_recorder)
+
+                        print(
+                            f"pci: wrist bleed-down latch |r|={contact0:.2f}N "
+                            f"→ f_des={f_des:.2f}N (continuous FT) "
+                            f"left0={abs(left_fz0-left_fz_base):.2f}N "
+                            f"lat0={feat_c0.lateral_m*1e3:.1f}mm",
+                            flush=True,
+                        )
+                        _log_force("latch")
+
+                        # --- Phase 1: unload spike until wrist residual ≈ f_des ---
+                        bleed_ok = False
+                        bleed_used = 0
+                        ok_streak = 0
+                        for bleed_used in range(1, max(0, n_bleed) + 1):
+                            contact, left_c, fz_r, fz_l = _log_force("bleed")
+                            resid_peak = max(resid_peak, contact)
+                            left_resid_peak = max(left_resid_peak, left_c)
+                            feat_i = features_from_raw(raw)
+                            tilt_i = _tray_tilt_entry_deg()
+                            phase_a_tilt_peak = max(phase_a_tilt_peak, tilt_i)
+                            phase_a_peg_tilt_peak = max(
+                                phase_a_peg_tilt_peak, _peg_tilt_entry_deg()
+                            )
+                            out_i = env._labeler.compute(raw)
+                            if (not out_i.tray_ok) or tilt_i > max_tilt_cf:
+                                print(
+                                    f"pci: bleed abort tilt={tilt_i:.1f}deg "
+                                    f"tray_ok={int(bool(out_i.tray_ok))} j={bleed_used}",
+                                    flush=True,
+                                )
+                                break
+                            if contact <= f_des + bleed_tol:
+                                ok_streak += 1
+                                step_b = float(
+                                    np.clip(kp * (f_des - contact), -max_step, max_step)
+                                )
+                                if ok_streak >= bleed_confirm:
+                                    bleed_ok = True
+                                    print(
+                                        f"pci: bleed OK j={bleed_used} "
+                                        f"|r|={contact:.2f}N left|r|={left_c:.2f}N "
+                                        f"FzR={fz_r:+.2f} FzL={fz_l:+.2f}",
+                                        flush=True,
+                                    )
+                                    if abs(step_b) > 1e-9:
+                                        _apply_axial(step_b)
+                                    break
+                            else:
+                                ok_streak = 0
+                                # Over target: always unload (watch wrist every step).
+                                step_b = -float(bleed_step)
+                            sink = along0_cf - float(feat_i.along_m)
+                            if float(feat_i.lateral_m) < min_lat_cf or sink >= max_sink:
+                                # Still allow unload away from mouth.
+                                step_b = min(0.0, step_b)
+                            _apply_axial(step_b)
+                            if bleed_used % 10 == 0 or bleed_used == 1:
+                                print(
+                                    f"pci: bleed j={bleed_used} |r|={contact:.2f}N "
+                                    f"left|r|={left_c:.2f}N "
+                                    f"FzR={fz_r:+.2f}N FzL={fz_l:+.2f}N "
+                                    f"step={step_b*1e3:.2f}mm "
+                                    f"lat={feat_i.lateral_m*1e3:.1f}mm "
+                                    f"tilt={tilt_i:.1f}deg",
+                                    flush=True,
+                                )
+                        steps += bleed_used
+                        meta["force_bleed_ok"] = bool(bleed_ok)
+                        meta["force_bleed_frames"] = int(bleed_used)
+
+                        # --- Path reverse: retreat along recorded approach wrist path.
+                        # User ask: 贴面后原路返回一点 (not tip-chase / not left yield).
+                        path_rev = bool(a_cfg.get("surface_path_reverse_enable", False))
+                        path_rev_done = False
+                        if path_rev:
+                            backoff = int(
+                                a_cfg.get("surface_path_reverse_backoff_frames", 30)
+                            )
+                            rev_need = float(
+                                a_cfg.get(
+                                    "surface_path_reverse_tip_m",
+                                    a_cfg.get("surface_tip_lift_m", 0.002),
+                                )
+                            )
+                            rev_frames = int(
+                                a_cfg.get("surface_path_reverse_frames", 60)
+                            )
+                            rev_step = float(
+                                a_cfg.get("surface_path_reverse_step_m", 0.00025)
+                            )
+                            site_now0 = actual_action44_from_sites(raw)
+                            hold_r = site_now0[0:3].copy()
+                            hold_l = site_now0[22:28].copy()
+                            hold_r_hand = site_now0[6:22].copy()
+                            # Firm-up right grasp before peel/retreat (scale>=1 only).
+                            lift_r_scale_pr = float(
+                                a_cfg.get("surface_lift_right_grasp_scale", 1.0)
+                            )
+                            if lift_r_scale_pr < 1.0 - 1e-9:
+                                raise ValueError(
+                                    "surface_lift_right_grasp_scale<1 forbidden "
+                                    f"(got {lift_r_scale_pr:.3f})"
+                                )
+                            if lift_r_scale_pr > 1.0 + 1e-9:
+                                hold_r_hand = np.clip(
+                                    np.maximum(
+                                        hold_r_hand, hold_r_hand * lift_r_scale_pr
+                                    ),
+                                    -1.5,
+                                    1.5,
+                                )
+                                for _tg in range(5):
+                                    cmd = hold.copy()
+                                    cmd[0:3] = hold_r
+                                    cmd[6:22] = hold_r_hand
+                                    cmd[22:28] = hold_l
+                                    cmd[28:44] = hold_l_hand
+                                    step_action44(
+                                        gym_env, cmd, ego_recorder=ego_recorder
+                                    )
+                                    _log_force("path_reverse_tighten")
+                                steps += 5
+                                print(
+                                    f"pci: path-reverse tighten right grasp "
+                                    f"scale={lift_r_scale_pr:.2f}",
+                                    flush=True,
+                                )
+                            # Large retreat along hole opening (out of surface).
+                            # History only sets lateral preference; distance is rev_dist.
+                            rev_dist = float(
+                                a_cfg.get("surface_path_reverse_dist_m", 0.04)
+                            )
+                            rev_tgt = hold_r + hole_u * rev_dist
+                            if wrist_pre_hist:
+                                idx = max(0, len(wrist_pre_hist) - 1 - max(0, backoff))
+                                hist_p = np.asarray(
+                                    wrist_pre_hist[idx], dtype=np.float64
+                                ).reshape(3)
+                                # Keep hist XY around hole, but force at least rev_dist out.
+                                lat = hist_p - hole_u * float(np.dot(hist_p - hold_r, hole_u))
+                                rev_tgt = hold_r + hole_u * rev_dist
+                                # blend a bit of historical lateral offset
+                                lat_off = lat - hold_r
+                                lat_off = lat_off - hole_u * float(np.dot(lat_off, hole_u))
+                                rev_tgt = rev_tgt + 0.35 * lat_off
+                            feat_lift0 = features_from_raw(raw)
+                            along_lift0 = float(feat_lift0.along_m)
+                            tip0 = np.asarray(
+                                feat_lift0.tip_pos, dtype=np.float64
+                            ).reshape(3)
+                            print(
+                                f"pci: path-reverse retreat "
+                                f"dist={rev_dist*1e3:.0f}mm backoff={backoff} "
+                                f"hist={len(wrist_pre_hist)} "
+                                f"need_tip≥{rev_need*1e3:.1f}mm "
+                                f"step={rev_step*1e3:.2f}mm frames≤{rev_frames} "
+                                f"keep_f={f_des:.2f}N left_share=0 (firm grasp)",
+                                flush=True,
+                            )
+                            lift_used = 0
+                            tip_up = 0.0
+                            along_rise = 0.0
+                            tip_d_xy = 0.0
+                            keep_f = bool(
+                                a_cfg.get("surface_path_reverse_keep_force", True)
+                            )
+                            for lift_used in range(1, max(0, rev_frames) + 1):
+                                d = rev_tgt - hold_r
+                                dn = float(np.linalg.norm(d))
+                                if dn < 1e-6:
+                                    break
+                                step_v = d * (min(rev_step, dn) / dn)
+                                hold_r = hold_r + step_v
+                                # Keep light contact while peeling tip up.
+                                if keep_f:
+                                    contact_pre, _, _, _ = _wrist_contact()
+                                    err_f = f_des - float(contact_pre)
+                                    ax_corr = float(
+                                        np.clip(kp * err_f, -max_step, max_step)
+                                    )
+                                    if err_f < 0.0:
+                                        ax_corr = float(
+                                            np.clip(
+                                                kp * unload_boost * err_f,
+                                                -max_step * unload_boost,
+                                                max_step,
+                                            )
+                                        )
+                                    hold_r = hold_r + press_ax * ax_corr
+                                cmd = hold.copy()
+                                cmd[0:3] = hold_r
+                                cmd[6:22] = hold_r_hand
+                                cmd[22:28] = hold_l  # left frozen
+                                cmd[28:44] = hold_l_hand
+                                step_action44(
+                                    gym_env, cmd, ego_recorder=ego_recorder
+                                )
+                                contact, left_c, fz_r, fz_l = _log_force("path_reverse")
+                                resid_peak = max(resid_peak, contact)
+                                left_resid_peak = max(left_resid_peak, left_c)
+                                if _grasp_lost():
+                                    meta["grasp_abort_phase"] = "path_reverse"
+                                    print(
+                                        f"pci: path-reverse ABORT grasp_slip="
+                                        f"{grasp_slip_peak*1e3:.1f}mm j={lift_used}",
+                                        flush=True,
+                                    )
+                                    break
+                                feat_l = features_from_raw(raw)
+                                tip_now = np.asarray(
+                                    feat_l.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                d_tip = tip_now - tip0
+                                tip_up = float(np.dot(d_tip, hole_u))
+                                along_rise = float(feat_l.along_m) - along_lift0
+                                tip_d_xy = float(
+                                    np.linalg.norm(
+                                        d_tip - hole_u * float(np.dot(d_tip, hole_u))
+                                    )
+                                )
+                                if tip_up >= rev_need or along_rise >= rev_need:
+                                    print(
+                                        f"pci: path-reverse done j={lift_used} "
+                                        f"tip_up={tip_up*1e3:.1f}mm "
+                                        f"Δalong={along_rise*1e3:.1f}mm "
+                                        f"|r|={contact:.2f}N "
+                                        f"slip={grasp_slip_peak*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                                if lift_used % 10 == 0 or lift_used == 1:
+                                    print(
+                                        f"pci: path-reverse j={lift_used} "
+                                        f"tip_up={tip_up*1e3:.1f}mm "
+                                        f"|r|={contact:.2f}N "
+                                        f"slip={grasp_slip_peak*1e3:.1f}mm "
+                                        f"remain={dn*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                            steps += int(lift_used)
+                            meta["surface_tip_up_m"] = float(tip_up)
+                            meta["surface_tip_along_rise_m"] = float(along_rise)
+                            meta["surface_light_lift_m"] = float(
+                                abs(float(np.dot(hold_r - site_now0[0:3], hole_u)))
+                            )
+                            meta["path_reverse"] = True
+                            meta["path_reverse_backoff_frames"] = int(backoff)
+                            path_rev_done = True
+
+                        # --- Phase 1a: break tip stiction (deep unload + tip-plane dither).
+                        # Static friction sticks tip after soft latch; axial bleed alone
+                        # may leave tip glued. Deep-unload then micro XY dither (right
+                        # only; left frozen) before firm-grasp micro-lift.
+                        stic_target = float(
+                            a_cfg.get("surface_stiction_unload_n", 0.0)
+                        )
+                        stic_frames = int(
+                            a_cfg.get("surface_stiction_unload_frames", 0)
+                        )
+                        stic_step = float(
+                            a_cfg.get(
+                                "surface_stiction_unload_step_m",
+                                bleed_step,
+                            )
+                        )
+                        dither_n = int(a_cfg.get("surface_stiction_dither_frames", 0))
+                        dither_amp = float(
+                            a_cfg.get("surface_stiction_dither_amp_m", 0.00035)
+                        )
+                        stic_used = 0
+                        dither_used = 0
+                        if stic_target > 0.0 and stic_frames > 0:
+                            print(
+                                f"pci: stiction deep-unload target≤{stic_target:.2f}N "
+                                f"frames≤{stic_frames} step={stic_step*1e3:.2f}mm "
+                                f"(left_share=0)",
+                                flush=True,
+                            )
+                            ok_s = 0
+                            for stic_used in range(1, stic_frames + 1):
+                                contact, left_c, fz_r, fz_l = _log_force("stiction_unload")
+                                resid_peak = max(resid_peak, contact)
+                                if _grasp_lost():
+                                    meta["grasp_abort_phase"] = "stiction_unload"
+                                    print(
+                                        f"pci: stiction-unload ABORT grasp_slip="
+                                        f"{grasp_slip_peak*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                                if contact <= stic_target:
+                                    ok_s += 1
+                                    if ok_s >= 3:
+                                        print(
+                                            f"pci: stiction-unload OK j={stic_used} "
+                                            f"|r|={contact:.2f}N",
+                                            flush=True,
+                                        )
+                                        break
+                                else:
+                                    ok_s = 0
+                                _apply_axial(-abs(stic_step), left_share=0.0)
+                                if stic_used % 10 == 0 or stic_used == 1:
+                                    print(
+                                        f"pci: stiction-unload j={stic_used} "
+                                        f"|r|={contact:.2f}N",
+                                        flush=True,
+                                    )
+                            steps += int(stic_used)
+                        meta["stiction_unload_frames"] = int(stic_used)
+                        meta["stiction_unload_n"] = float(stic_target)
+                        if dither_n > 0 and dither_amp > 0.0:
+                            t1_d, t2_d, _ = hole_task_basis(hole_u)
+                            print(
+                                f"pci: stiction dither frames={dither_n} "
+                                f"amp={dither_amp*1e3:.2f}mm (right only)",
+                                flush=True,
+                            )
+                            for dither_used in range(1, dither_n + 1):
+                                # square orbit in tip plane to break static friction
+                                ph = (dither_used - 1) % 4
+                                if ph == 0:
+                                    d_xy = t1_d * dither_amp
+                                elif ph == 1:
+                                    d_xy = t2_d * dither_amp
+                                elif ph == 2:
+                                    d_xy = -t1_d * dither_amp
+                                else:
+                                    d_xy = -t2_d * dither_amp
+                                hold_r = hold_r + d_xy
+                                cmd = hold.copy()
+                                cmd[0:3] = hold_r
+                                cmd[6:22] = hold_r_hand
+                                cmd[22:28] = hold_l
+                                cmd[28:44] = hold_l_hand
+                                step_action44(
+                                    gym_env, cmd, ego_recorder=ego_recorder
+                                )
+                                contact, left_c, fz_r, fz_l = _log_force("stiction_dither")
+                                resid_peak = max(resid_peak, contact)
+                                if _grasp_lost():
+                                    meta["grasp_abort_phase"] = "stiction_dither"
+                                    print(
+                                        f"pci: stiction-dither ABORT grasp_slip="
+                                        f"{grasp_slip_peak*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                                if dither_used % 8 == 0 or dither_used == 1:
+                                    print(
+                                        f"pci: stiction-dither j={dither_used} "
+                                        f"|r|={contact:.2f}N "
+                                        f"slip={grasp_slip_peak*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                            steps += int(dither_used)
+                            # Center back: reverse last half-orbit average by 0 (hold).
+                            site_d = actual_action44_from_sites(raw)
+                            hold_r = site_d[0:3].copy()
+                        meta["stiction_dither_frames"] = int(dither_used)
+                        meta["stiction_dither_amp_m"] = float(dither_amp)
+
+                        # Light re-touch to f_des after unload/dither (keep contact for lift).
+                        n_pre_touch = int(
+                            a_cfg.get("surface_stiction_retouch_frames", 0)
+                        )
+                        pre_touch_used = 0
+                        for pre_touch_used in range(1, max(0, n_pre_touch) + 1):
+                            contact, left_c, fz_r, fz_l = _log_force("stiction_retouch")
+                            resid_peak = max(resid_peak, contact)
+                            left_resid_peak = max(left_resid_peak, left_c)
+                            if _grasp_lost():
+                                meta["grasp_abort_phase"] = "stiction_retouch"
+                                break
+                            err = f_des - contact
+                            step = float(np.clip(kp * err, -max_step, max_step))
+                            if err > 0.0:
+                                step = max(step, min(float(bleed_step) * 0.25, 0.00015))
+                            _apply_axial(step, left_share=0.0)
+                            if abs(contact - f_des) <= bleed_tol and pre_touch_used >= 4:
+                                print(
+                                    f"pci: stiction-retouch OK j={pre_touch_used} "
+                                    f"|r|={contact:.2f}N",
+                                    flush=True,
+                                )
+                                break
+                            if pre_touch_used % 5 == 0 or pre_touch_used == 1:
+                                print(
+                                    f"pci: stiction-retouch j={pre_touch_used} "
+                                    f"|r|={contact:.2f}N",
+                                    flush=True,
+                                )
+                        steps += int(pre_touch_used)
+                        meta["stiction_retouch_frames"] = int(pre_touch_used)
+
+                        # --- Phase 1b: firm-grasp lift (skip if path-reverse already ran).
+                        lift_m = float(a_cfg.get("surface_light_lift_m", 0.006))
+                        tip_lift_need = float(a_cfg.get("surface_tip_lift_m", 0.0015))
+                        n_lift_cap = int(a_cfg.get("surface_light_lift_frames", 50))
+                        tip_servo_lift = bool(
+                            a_cfg.get("surface_tip_servo_lift_enable", False)
+                        )
+                        per = float(
+                            a_cfg.get(
+                                "surface_light_lift_step_m",
+                                max(lift_m / float(max(n_lift_cap, 1)), 0.00015)
+                                if n_lift_cap > 0
+                                else 0.00015,
+                            )
+                        )
+                        per = float(np.clip(per, 1e-5, 0.001))
+                        lift_r_scale = float(
+                            a_cfg.get("surface_lift_right_grasp_scale", 1.0)
+                        )
+                        if not path_rev_done:
+                            if lift_r_scale < 1.0 - 1e-9:
+                                raise ValueError(
+                                    "surface_lift_right_grasp_scale<1 forbidden "
+                                    f"(got {lift_r_scale:.3f}); tip follow needs firm grasp"
+                                )
+                            if lift_r_scale > 1.0 + 1e-9:
+                                # maximum(..., *scale): close fingers harder without opening.
+                                hold_r_hand = np.clip(
+                                    np.maximum(hold_r_hand, hold_r_hand * lift_r_scale),
+                                    -1.5,
+                                    1.5,
+                                )
+                                for _tg in range(3):
+                                    cmd = hold.copy()
+                                    cmd[0:3] = hold_r
+                                    cmd[6:22] = hold_r_hand
+                                    cmd[22:28] = hold_l
+                                    cmd[28:44] = hold_l_hand
+                                    step_action44(
+                                        gym_env, cmd, ego_recorder=ego_recorder
+                                    )
+                                    _log_force("lift_tighten")
+                                steps += 3
+                                print(
+                                    f"pci: lift tighten right grasp scale={lift_r_scale:.2f}",
+                                    flush=True,
+                                )
+                            feat_lift0 = features_from_raw(raw)
+                            along_lift0 = float(feat_lift0.along_m)
+                            tip0 = np.asarray(feat_lift0.tip_pos, dtype=np.float64).reshape(3)
+                            lift_used = 0
+                            tip_d_xy = 0.0
+                            along_rise = 0.0
+                            tip_up = 0.0
+                            if tip_servo_lift:
+                                # Scheme D: lift tip OUT along hole opening (+hole);
+                                # wrist := tip_target + frozen (wrist0-tip0).
+                                tip_lift_tgt = float(
+                                    a_cfg.get("surface_tip_servo_lift_m", 0.0025)
+                                )
+                                tip_lift_need = float(
+                                    a_cfg.get(
+                                        "surface_tip_servo_lift_need_m",
+                                        a_cfg.get("surface_tip_lift_m", 0.0015),
+                                    )
+                                )
+                                n_lift_cap = int(
+                                    a_cfg.get("surface_tip_servo_lift_frames", 80)
+                                )
+                                max_w_step = float(
+                                    a_cfg.get("surface_tip_servo_lift_wrist_step_m", 0.005)
+                                )
+                                # +hole_u = out of hole (= -press_ax). User "抬起沿 -hole"
+                                # if hole:=insert; here hole_axis is opening, so +hole.
+                                tip_target = tip0 + hole_u * tip_lift_tgt
+                                site_lift0 = actual_action44_from_sites(raw)
+                                offset_wt0 = site_lift0[0:3].copy() - tip0
+                                print(
+                                    f"pci: tip-servo-lift (scheme D) need≥{tip_lift_need*1e3:.1f}mm "
+                                    f"tgt={tip_lift_tgt*1e3:.1f}mm wrist_step={max_w_step*1e3:.1f}mm "
+                                    f"f_des={f_des:.2f}N (firm grasp, frozen wrist-tip offset)",
+                                    flush=True,
+                                )
+                                for lift_used in range(1, max(0, n_lift_cap) + 1):
+                                    feat_l = features_from_raw(raw)
+                                    site_now = actual_action44_from_sites(raw)
+                                    hold_r = _tip_servo_lift_wrist_cmd(
+                                        tip_target,
+                                        site_now[0:3],
+                                        max_w_step,
+                                        offset_wt0,
+                                    )
+                                    hold_l[0:3] = site_now[22:25].copy()
+                                    cmd = hold.copy()
+                                    cmd[0:3] = hold_r
+                                    cmd[6:22] = hold_r_hand
+                                    cmd[22:28] = hold_l
+                                    cmd[28:44] = hold_l_hand
+                                    step_action44(
+                                        gym_env, cmd, ego_recorder=ego_recorder
+                                    )
+                                    contact, left_c, fz_r, fz_l = _log_force("lift")
+                                    resid_peak = max(resid_peak, contact)
+                                    left_resid_peak = max(left_resid_peak, left_c)
+                                    feat_l = features_from_raw(raw)
+                                    along_now = float(feat_l.along_m)
+                                    tip_now = np.asarray(
+                                        feat_l.tip_pos, dtype=np.float64
+                                    ).reshape(3)
+                                    d_tip = tip_now - tip0
+                                    tip_d_xy = float(
+                                        np.linalg.norm(
+                                            d_tip - hole_u * float(np.dot(d_tip, hole_u))
+                                        )
+                                    )
+                                    along_rise = along_now - along_lift0
+                                    # tip_up = lift out along opening (+hole); gate wants ≥need.
+                                    tip_up = float(np.dot(d_tip, hole_u))
+                                    if _grasp_lost():
+                                        print(
+                                            f"pci: tip-servo-lift ABORT grasp_slip="
+                                            f"{grasp_slip_peak*1e3:.1f}mm "
+                                            f"> {grasp_slip_lim*1e3:.1f}mm j={lift_used}",
+                                            flush=True,
+                                        )
+                                        meta["grasp_abort_phase"] = "tip_servo_lift"
+                                        break
+                                    if (
+                                        along_rise >= tip_lift_need
+                                        or tip_up >= tip_lift_need
+                                    ):
+                                        print(
+                                            f"pci: tip-servo-lift done j={lift_used} "
+                                            f"Δalong={along_rise*1e3:.1f}mm "
+                                            f"tip_up={tip_up*1e3:.1f}mm "
+                                            f"tip_xy={tip_d_xy*1e3:.1f}mm |r|={contact:.2f}N",
+                                            flush=True,
+                                        )
+                                        break
+                                    if lift_used % 15 == 0 or lift_used == 1:
+                                        print(
+                                            f"pci: tip-servo-lift j={lift_used} "
+                                            f"tip_up={tip_up*1e3:.1f}mm "
+                                            f"Δalong={along_rise*1e3:.1f}mm "
+                                            f"|r|={contact:.2f}N",
+                                            flush=True,
+                                        )
+                                # Refresh wrist hold from sites for subsequent axial P.
+                                site_af = actual_action44_from_sites(raw)
+                                hold_r = site_af[0:3].copy()
+                                hold_l = site_af[22:28].copy()
+                                steps += int(lift_used)
+                                meta["surface_light_lift_m"] = float(tip_lift_tgt)
+                                meta["surface_tip_servo_lift"] = True
+                                meta["surface_tip_servo_lift_m"] = float(tip_lift_tgt)
+                                meta["surface_tip_servo_lift_wrist_step_m"] = float(
+                                    max_w_step
+                                )
+                                meta["surface_tip_along_rise_m"] = float(along_rise)
+                                meta["surface_tip_up_m"] = float(tip_up)
+                            else:
+                                # Scheme C knobs (left yield / dual axial unload). Defaults
+                                # keep prior firm-grasp behavior when unset.
+                                lift_left_share = float(
+                                    a_cfg.get(
+                                        "surface_lift_left_share",
+                                        left_share_cf,
+                                    )
+                                )
+                                lift_left_admit_scale = float(
+                                    a_cfg.get("surface_lift_left_admit_scale", 0.0)
+                                )
+                                lift_left_extra = float(
+                                    a_cfg.get("surface_lift_left_extra_unload_m", 0.0)
+                                )
+                                lift_admit_c: LeftWristAdmitController | None = None
+                                if lift_left_admit_scale > 1e-9:
+                                    lift_admit_c = LeftWristAdmitController(
+                                        _left_wrist_admit_config(cfg)
+                                    )
+                                    lift_admit_c.reset(read_wrist_wrench_world(raw)[1])
+                                    lift_admit_c.config.enable = True
+                                print(
+                                    f"pci: tip-lift (scheme C left-yield) "
+                                    f"need≥{tip_lift_need*1e3:.1f}mm "
+                                    f"cmd_cap={lift_m*1e3:.1f}mm f_des={f_des:.2f}N "
+                                    f"left_share={lift_left_share:.2f} "
+                                    f"admit={lift_left_admit_scale:.2f} "
+                                    f"extra_L={lift_left_extra*1e3:.2f}mm "
+                                    f"r_scale={lift_r_scale:.2f}",
+                                    flush=True,
+                                )
+                                for lift_used in range(1, max(0, n_lift_cap) + 1):
+                                    _apply_axial(-per, left_share=lift_left_share)
+                                    if lift_left_extra > 1e-9:
+                                        hold_l[0:3] = hold_l[0:3] + (
+                                            (-press_ax) * lift_left_extra
+                                        )
+                                        cmd = hold.copy()
+                                        cmd[0:3] = hold_r
+                                        cmd[6:22] = hold_r_hand
+                                        cmd[22:28] = hold_l
+                                        cmd[28:44] = hold_l_hand
+                                        step_action44(
+                                            gym_env, cmd, ego_recorder=ego_recorder
+                                        )
+                                    if lift_admit_c is not None:
+                                        d_adm = (
+                                            lift_admit_c.step(
+                                                read_wrist_wrench_world(raw)[1],
+                                                approach_axis=-hole_u,
+                                            )
+                                            * lift_left_admit_scale
+                                        )
+                                        d_ax = hole_u * float(np.dot(d_adm, hole_u))
+                                        hold_l[0:3] = hold_l[0:3] + d_ax
+                                        cmd = hold.copy()
+                                        cmd[0:3] = hold_r
+                                        cmd[6:22] = hold_r_hand
+                                        cmd[22:28] = hold_l
+                                        cmd[28:44] = hold_l_hand
+                                        step_action44(
+                                            gym_env, cmd, ego_recorder=ego_recorder
+                                        )
+                                    contact, left_c, fz_r, fz_l = _log_force("lift")
+                                    resid_peak = max(resid_peak, contact)
+                                    left_resid_peak = max(left_resid_peak, left_c)
+                                    feat_l = features_from_raw(raw)
+                                    along_now = float(feat_l.along_m)
+                                    tip_now = np.asarray(
+                                        feat_l.tip_pos, dtype=np.float64
+                                    ).reshape(3)
+                                    d_tip = tip_now - tip0
+                                    tip_d_xy = float(
+                                        np.linalg.norm(
+                                            d_tip - hole_u * float(np.dot(d_tip, hole_u))
+                                        )
+                                    )
+                                    along_rise = along_now - along_lift0
+                                    # tip_up: rise away from surface (= +hole_u; press=-hole_u).
+                                    tip_up = float(np.dot(d_tip, hole_u))
+                                    if _grasp_lost():
+                                        print(
+                                            f"pci: tip-lift ABORT grasp_slip="
+                                            f"{grasp_slip_peak*1e3:.1f}mm "
+                                            f"> {grasp_slip_lim*1e3:.1f}mm j={lift_used}",
+                                            flush=True,
+                                        )
+                                        meta["grasp_abort_phase"] = "tip_lift"
+                                        break
+                                    if (
+                                        along_rise >= tip_lift_need
+                                        or tip_up >= tip_lift_need
+                                        or (lift_used * per) >= lift_m
+                                    ):
+                                        print(
+                                            f"pci: tip-lift done j={lift_used} "
+                                            f"cmd={lift_used*per*1e3:.1f}mm "
+                                            f"Δalong={along_rise*1e3:.1f}mm "
+                                            f"tip_up={tip_up*1e3:.1f}mm "
+                                            f"tip_xy={tip_d_xy*1e3:.1f}mm |r|={contact:.2f}N",
+                                            flush=True,
+                                        )
+                                        break
+                                steps += int(lift_used)
+                                meta["surface_light_lift_m"] = float(lift_used * per)
+                                meta["surface_tip_along_rise_m"] = float(along_rise)
+                                meta["surface_tip_up_m"] = float(tip_up)
+                                meta["surface_lift_left_share"] = float(lift_left_share)
+                                meta["surface_lift_left_admit_scale"] = float(
+                                    lift_left_admit_scale
+                                )
+                                meta["surface_lift_left_extra_unload_m"] = float(
+                                    lift_left_extra
+                                )
+                                meta["scheme_c_left_yield"] = True
+
+
+                        # Optional soft re-touch (off by default — hard retouch jams tip).
+                        n_retouch = int(a_cfg.get("surface_light_retouch_frames", 0))
+                        j_rt = 0
+                        for j_rt in range(1, max(0, n_retouch) + 1):
+                            contact, left_c, fz_r, fz_l = _log_force("retouch")
+                            resid_peak = max(resid_peak, contact)
+                            left_resid_peak = max(left_resid_peak, left_c)
+                            err = f_des - contact
+                            step = float(np.clip(kp * err, -max_step, max_step))
+                            if err > 0.0:
+                                step = max(step, min(float(bleed_step) * 0.35, 0.0002))
+                            elif err < 0.0:
+                                step = float(
+                                    np.clip(
+                                        kp * unload_boost * err,
+                                        -max_step * unload_boost,
+                                        max_step,
+                                    )
+                                )
+                            _apply_axial(step)
+                            in_band = (
+                                abs(contact - f_des) <= bleed_tol
+                                and contact >= 0.5 * f_des
+                            )
+                            if in_band and j_rt >= 6:
+                                print(
+                                    f"pci: retouch OK j={j_rt} |r|={contact:.2f}N "
+                                    f"left|r|={left_c:.2f}N",
+                                    flush=True,
+                                )
+                                break
+                        if n_retouch > 0:
+                            steps += int(j_rt)
+
+                        # --- Phase 2: light dual const-force hold (wrist P) ---
+                        print(
+                            f"pci: dual const-force hold f_des={f_des:.2f}N "
+                            f"frames={n_cf} left_share={left_share_cf:.2f} "
+                            f"bleed_ok={int(bleed_ok)}",
+                            flush=True,
+                        )
+                        used = 0
+                        for used in range(1, max(0, n_cf) + 1):
+                            contact, left_c, fz_r, fz_l = _log_force("hold")
+                            resid_peak = max(resid_peak, contact)
+                            left_resid_peak = max(left_resid_peak, left_c)
+                            err = f_des - contact
+                            step = float(np.clip(kp * err, -max_step, max_step))
+                            # Overshoot: unload faster than press.
+                            if err < 0.0:
+                                step = float(
+                                    np.clip(
+                                        kp * unload_boost * err,
+                                        -max_step * unload_boost,
+                                        max_step,
+                                    )
+                                )
+                            feat_i = features_from_raw(raw)
+                            sink = along0_cf - float(feat_i.along_m)
+                            if (
+                                float(feat_i.lateral_m) < min_lat_cf
+                                or sink >= max_sink
+                            ):
+                                step = min(0.0, step)
+                            _apply_axial(step)
+                            tilt_i = _tray_tilt_entry_deg()
+                            phase_a_tilt_peak = max(phase_a_tilt_peak, tilt_i)
+                            phase_a_peg_tilt_peak = max(
+                                phase_a_peg_tilt_peak, _peg_tilt_entry_deg()
+                            )
+                            out_i = env._labeler.compute(raw)
+                            if (not out_i.tray_ok) or tilt_i > max_tilt_cf:
+                                print(
+                                    f"pci: const-force abort tilt={tilt_i:.1f}deg "
+                                    f"tray_ok={int(bool(out_i.tray_ok))} j={used}",
+                                    flush=True,
+                                )
+                                break
+                            if used % 15 == 0 or used == 1:
+                                print(
+                                    f"pci: const-force j={used} |r|={contact:.2f}N "
+                                    f"left|r|={left_c:.2f}N "
+                                    f"FzR={fz_r:+.2f}N FzL={fz_l:+.2f}N "
+                                    f"step={step*1e3:.2f}mm "
+                                    f"lat={feat_i.lateral_m*1e3:.1f}mm "
+                                    f"tilt={tilt_i:.1f}deg",
+                                    flush=True,
+                                )
+                        steps += used
+                        feat_s = features_from_raw(raw)
+                        out_s = env._labeler.compute(raw)
+                        meta["soft_latched"] = True
+                        meta["latch_soft_contact"] = True
+                        meta["stop_at_soft_contact"] = True
+                        meta["const_force_hold"] = True
+                        meta["const_force_des_n"] = float(f_des)
+                        meta["const_force_frames"] = int(used)
+                        meta["const_force_resid_peak_n"] = float(resid_peak)
+                        meta["const_force_left_resid_peak_n"] = float(left_resid_peak)
+                        meta["const_force_left_share"] = float(left_share_cf)
+                        meta["fz_contact"] = float(fz)
+                        meta["fz_delta"] = float(d_fz)
+                        meta["fz_baseline_const"] = float(fz_base_c)
+                        print(
+                            f"pci: const-force done — |r|_peak={resid_peak:.2f}N "
+                            f"left_peak={left_resid_peak:.2f}N "
+                            f"lat={feat_s.lateral_m*1e3:.1f}mm "
+                            f"along={feat_s.along_m*1e3:.1f}mm tip={feat_s.tip_socket_dist_m*1e3:.1f}mm "
+                            f"tilt={phase_a_tilt_peak:.2f}deg → tip-spiral",
+                            flush=True,
+                        )
+                        # Firm-grasp tip-plane Archimedean spiral + light force.
+                        # Wrist mocap spiral alone does not move tip (finger stretch);
+                        # servo wrist so TIP tracks the spiral (privileged_diagnostic).
+                        _update_grasp_slip()
+                        if grasp_slip_peak > grasp_slip_lim or meta.get(
+                            "grasp_abort_phase"
+                        ):
+                            feat_s = features_from_raw(raw)
+                            out_s = env._labeler.compute(raw)
+                            meta["align_lat_mm"] = feat_s.lateral_m * 1000
+                            meta["align_along_mm"] = feat_s.along_m * 1000
+                            meta["phase_a_tray_tilt_peak_deg"] = float(phase_a_tilt_peak)
+                            meta["phase_a_peg_tilt_peak_deg"] = float(phase_a_peg_tilt_peak)
+                            meta["phase_a_rel_rot_peak_rad"] = float(phase_a_rel_peak)
+                            meta["spiral_frames"] = 0
+                            meta["spiral_reason"] = "grasp_slip_pre_spiral"
+                            meta["spiral_tip_xy_peak_mm"] = 0.0
+                            meta["force_trace"] = force_trace
+                            meta["force_trace_n"] = int(len(force_trace))
+                            meta["grasp_slip_peak_m"] = float(grasp_slip_peak)
+                            meta["grasp_latch_ok"] = True
+                            gate = _priv_tip_spiral_gate(meta, cfg)
+                            meta["priv_tip_spiral_gate"] = gate
+                            meta.update(_final_geom_meta(feat_s, out_s, ctrl))
+                            print(
+                                f"pci: skip spiral — grasp_slip="
+                                f"{grasp_slip_peak*1e3:.1f}mm "
+                                f"GATE=FAIL grasp={gate.get('grasp_ok')}",
+                                flush=True,
+                            )
+                            for rs in gate.get("reasons", []):
+                                print(f"pci: GATE fail — {rs}", flush=True)
+                            return steps, "priv_tip_spiral_gate_fail", meta
+                        # Re-latch grasp baseline AFTER successful lift so spiral
+                        # grasp_slip measures "drop during spiral", not peel stretch.
+                        geom_sp0 = read_priv_grasp_geom(raw)
+                        peg_in_r0 = _peg_in_right_wrist(geom_sp0)
+                        grasp_slip_peak = 0.0
+                        meta["grasp_slip_peak_m"] = 0.0
+                        meta["grasp_relatch_after_lift"] = True
+                        site_sp = actual_action44_from_sites(raw)
+                        hold_r = site_sp[0:3].copy()
+                        hold_l = site_sp[22:28].copy()
+                        # Keep firm grasp command (don't drop back to stretched site q).
+                        hold_r_hand = np.clip(
+                            np.maximum(site_sp[6:22].copy(), hold_r_hand),
+                            -1.5,
+                            1.5,
+                        )
+                        hold_l_hand = site_sp[28:44].copy()
+                        if getattr(ctrl, "_hold_l_hand", None) is not None:
+                            hold_l_hand = np.asarray(
+                                ctrl._hold_l_hand, dtype=np.float64
+                            ).reshape(16)
+                        feat_sp0 = features_from_raw(raw)
+                        tip_sp0 = np.asarray(feat_sp0.tip_pos, dtype=np.float64).reshape(3)
+                        t1, t2, _ax_h = hole_task_basis(feat_sp0.hole_axis)
+                        spiral_center_mode = str(
+                            a_cfg.get("surface_tip_spiral_center", "tip")
+                        ).strip().lower()
+                        if spiral_center_mode == "socket":
+                            spiral_center = _hole_axis_point_at_tip(
+                                tip_sp0,
+                                feat_sp0.socket_pos,
+                                feat_sp0.hole_axis,
+                            )
+                        else:
+                            spiral_center = tip_sp0.copy()
+                        lat_shrink_only = bool(
+                            a_cfg.get("surface_spiral_lat_shrink_only", False)
+                        )
+                        freeze_off = bool(
+                            a_cfg.get("surface_tip_spiral_freeze_offset", True)
+                        )
+                        offset_wt0_sp = site_sp[0:3].copy() - tip_sp0
+                        search_mode = str(
+                            a_cfg.get("surface_tip_search_mode", "spiral")
+                        ).strip().lower()
+                        _priv_lat_modes = ("priv_lat", "priv_lat_lissajous")
+                        if search_mode not in (
+                            "spiral",
+                            "lissajous",
+                            *_priv_lat_modes,
+                        ):
+                            search_mode = "spiral"
+                        n_sp = int(a_cfg.get("surface_spiral_frames", 180))
+                        if search_mode in _priv_lat_modes:
+                            n_search = int(
+                                a_cfg.get("surface_priv_lat_frames", 480)
+                            )
+                        elif search_mode == "lissajous":
+                            n_search = int(
+                                a_cfg.get("surface_lissajous_frames", n_sp)
+                            )
+                        else:
+                            n_search = n_sp
+                        if search_mode in ("lissajous", *_priv_lat_modes):
+                            spiral_center = _hole_axis_point_at_tip(
+                                tip_sp0,
+                                feat_sp0.socket_pos,
+                                feat_sp0.hole_axis,
+                            )
+                            spiral_center_mode = "socket"
+                        mouth_lat = float(
+                            a_cfg.get("surface_spiral_mouth_lat_m", 0.0045)
+                        )
+                        max_tilt_sp = float(
+                            a_cfg.get(
+                                "surface_spiral_max_tilt_deg",
+                                a_cfg.get("surface_const_force_max_tilt_deg", 8.0),
+                            )
+                        )
+                        pitch = float(
+                            a_cfg.get(
+                                "surface_tip_spiral_pitch_m",
+                                cfg.get("compliant", {})
+                                .get("search", {})
+                                .get("spiral_pitch_m", 0.0025),
+                            )
+                        )
+                        dtheta = float(a_cfg.get("surface_tip_spiral_step_rad", 0.16))
+                        r0_cfg = float(a_cfg.get("surface_tip_spiral_r0_m", 0.002))
+                        r0 = r0_cfg
+                        r_max = float(a_cfg.get("surface_tip_spiral_rmax_m", 0.018))
+                        r_min = float(
+                            a_cfg.get(
+                                "surface_tip_spiral_rmin_m",
+                                a_cfg.get("surface_spiral_mouth_lat_m", 0.0045),
+                            )
+                        )
+                        spiral_dir = str(
+                            a_cfg.get("surface_tip_spiral_direction", "outward")
+                        ).strip().lower()
+                        if spiral_dir not in ("outward", "inward"):
+                            spiral_dir = "outward"
+                        track = float(a_cfg.get("surface_tip_spiral_track", 0.9))
+                        max_xy = float(a_cfg.get("surface_tip_spiral_max_step_m", 0.0035))
+                        left_share_sp = float(
+                            a_cfg.get("surface_spiral_left_share", 0.05)
+                        )
+                        spiral_lat_min = float(feat_sp0.lateral_m)
+                        spiral_resid_peak = 0.0
+                        spiral_reason = "spiral_timeout"
+                        tip_xy_peak = 0.0
+                        off0_xy = _tip_lat_offset_xy(
+                            tip_sp0, spiral_center, feat_sp0.hole_axis
+                        )
+                        r_start = float(np.linalg.norm(off0_xy))
+                        theta_sp = (
+                            float(np.arctan2(float(off0_xy @ t2), float(off0_xy @ t1)))
+                            if r_start > 1e-9
+                            else 0.0
+                        )
+                        if spiral_center_mode == "socket" and r_start > r0:
+                            r0 = r_start
+                        pre_lat_axis = _hole_axis_point_at_tip(
+                            tip_sp0, feat_sp0.socket_pos, feat_sp0.hole_axis
+                        )
+                        pre_lat_n = int(a_cfg.get("surface_spiral_pre_lat_frames", 0))
+                        pre_lat_step = float(
+                            a_cfg.get("surface_spiral_pre_lat_step_m", 0.002)
+                        )
+                        pre_lat_used = 0
+                        lis_wx = float(a_cfg.get("surface_lissajous_wx", 0.14))
+                        lis_wy = float(a_cfg.get("surface_lissajous_wy", 0.19))
+                        lis_phi = float(a_cfg.get("surface_lissajous_phase_rad", 1.5708))
+                        lis_ay_ratio = float(a_cfg.get("surface_lissajous_ay_ratio", 0.75))
+                        lis_shrink = bool(
+                            a_cfg.get("surface_lissajous_shrink_enable", True)
+                        )
+                        lis_amin = float(
+                            a_cfg.get(
+                                "surface_lissajous_amin_m",
+                                a_cfg.get("surface_spiral_mouth_lat_m", 0.0045),
+                            )
+                        )
+                        lis_ax0 = float(a_cfg.get("surface_lissajous_ax_m", 0.0))
+                        lis_ay0 = float(a_cfg.get("surface_lissajous_ay_m", 0.0))
+                        priv_lat_step = float(
+                            a_cfg.get("surface_priv_lat_step_m", 0.002)
+                        )
+                        priv_lat_axis_ff = float(
+                            a_cfg.get("surface_priv_lat_axis_ff", 0.0)
+                        )
+                        priv_dith_ax = float(
+                            a_cfg.get("surface_priv_lat_dither_ax_m", 0.004)
+                        )
+                        priv_dith_ay = float(
+                            a_cfg.get(
+                                "surface_priv_lat_dither_ay_m",
+                                priv_dith_ax * lis_ay_ratio,
+                            )
+                        )
+                        priv_dith_lat0 = float(
+                            a_cfg.get("surface_priv_lat_dither_lat_scale_m", 0.012)
+                        )
+                        priv_lat_along_hold = bool(
+                            a_cfg.get("surface_priv_lat_along_hold", False)
+                        )
+                        priv_lat_along_hold_max = float(
+                            a_cfg.get(
+                                "surface_priv_lat_along_hold_max_m",
+                                a_cfg.get("mouth_max_along_m", 0.102),
+                            )
+                        )
+                        along_hold_m: float | None = None
+                        stick_enable = bool(
+                            a_cfg.get("surface_priv_lat_stick_enable", True)
+                        )
+                        stick_win = int(
+                            a_cfg.get("surface_priv_lat_stick_window", 20)
+                        )
+                        stick_tip_m = float(
+                            a_cfg.get("surface_priv_lat_stick_tip_move_m", 0.0004)
+                        )
+                        stick_lift_gain = float(
+                            a_cfg.get(
+                                "surface_priv_lat_stick_lift_gain_m_per_rad", 0.004
+                            )
+                        )
+                        stick_lat_lift = float(
+                            a_cfg.get("surface_priv_lat_stick_lat_lift_gain", 0.02)
+                        )
+                        stick_max_lift = float(
+                            a_cfg.get("surface_priv_lat_stick_max_lift_m", 0.0012)
+                        )
+                        stick_unload_gain = float(
+                            a_cfg.get(
+                                "surface_priv_lat_stick_unload_gain_n_per_rad", 0.8
+                            )
+                        )
+                        stick_max_unload = float(
+                            a_cfg.get("surface_priv_lat_stick_max_unload_n", 0.12)
+                        )
+                        stick_hop_every = int(
+                            a_cfg.get("surface_priv_lat_stick_hop_every", 40)
+                        )
+                        stick_hop_lift = float(
+                            a_cfg.get("surface_priv_lat_stick_hop_lift_m", 0.0025)
+                        )
+                        stick_lift_frames = int(
+                            a_cfg.get("surface_priv_lat_stick_lift_frames", 18)
+                        )
+                        stick_slide_frames = int(
+                            a_cfg.get("surface_priv_lat_stick_slide_frames", 30)
+                        )
+                        stick_slide_step = float(
+                            a_cfg.get("surface_priv_lat_stick_slide_step_m", 0.004)
+                        )
+                        stick_clear_lift = float(
+                            a_cfg.get("surface_priv_lat_stick_clear_lift_m", 0.003)
+                        )
+                        stick_clear_n = float(
+                            a_cfg.get("surface_priv_lat_stick_clear_contact_n", 0.06)
+                        )
+                        tip_hist_sp: list[np.ndarray] = []
+                        stick_active = False
+                        stick_count = 0
+                        stick_streak = 0
+                        stick_live_off = False
+                        stick_phase = "search"
+                        stick_phase_i = 0
+                        stick_offset_wt: np.ndarray | None = None
+                        stick_lat_enter = 0.0
+                        stick_along0: float | None = None
+                        stick_reached_mouth = False
+                        stick_lat_best = 1e9
+                        stick_stall = 0
+                        mouth_wiggle_enable = bool(
+                            a_cfg.get("surface_mouth_wiggle_enable", False)
+                        )
+                        mouth_continue = bool(
+                            a_cfg.get("surface_mouth_continue_on_near", True)
+                        ) and mouth_wiggle_enable
+                        n_mouth = int(a_cfg.get("surface_mouth_wiggle_frames", 180))
+                        if stick_enable:
+                            n_mouth = max(n_mouth, 420)
+                        mouth_xy_m = float(
+                            a_cfg.get("surface_mouth_wiggle_xy_m", 0.0015)
+                        )
+                        mouth_wx = float(
+                            a_cfg.get(
+                                "surface_mouth_wiggle_wx",
+                                a_cfg.get("surface_lissajous_wx", 0.22),
+                            )
+                        )
+                        mouth_wy = float(
+                            a_cfg.get(
+                                "surface_mouth_wiggle_wy",
+                                a_cfg.get("surface_lissajous_wy", 0.31),
+                            )
+                        )
+                        mouth_phi = float(
+                            a_cfg.get("surface_mouth_wiggle_phase_rad", lis_phi)
+                        )
+                        mouth_rot_rad = float(
+                            a_cfg.get("surface_mouth_wiggle_rot_rad", 0.008)
+                        )
+                        mouth_lat_step = float(
+                            a_cfg.get("surface_mouth_wiggle_lat_step_m", 0.001)
+                        )
+                        mouth_axis_ff = float(
+                            a_cfg.get("surface_mouth_wiggle_axis_ff", 0.3)
+                        )
+                        mouth_ax_step = float(
+                            a_cfg.get("surface_mouth_wiggle_ax_step_m", 0.00008)
+                        )
+                        mouth_jam_fxy = float(
+                            a_cfg.get("surface_mouth_jam_fxy_n", 0.35)
+                        )
+                        mouth_jam_frames = int(
+                            a_cfg.get("surface_mouth_jam_frames", 8)
+                        )
+                        mouth_tray_admit = float(
+                            a_cfg.get("surface_mouth_tray_admit_scale", 0.0)
+                        )
+                        mouth_tray_admit_max = float(
+                            a_cfg.get("surface_mouth_tray_admit_max_m", 0.0005)
+                        )
+                        if search_mode == "priv_lat_lissajous":
+                            print(
+                                f"pci: priv-lat-liss+force f_des={f_des:.2f}N frames={n_search} "
+                                f"lat_step={priv_lat_step*1e3:.2f}mm axis_ff={priv_lat_axis_ff:.2f} "
+                                f"dith={priv_dith_ax*1e3:.1f}/{priv_dith_ay*1e3:.1f}mm "
+                                f"lat0={feat_sp0.lateral_m*1e3:.1f}mm pre_lat={pre_lat_n}",
+                                flush=True,
+                            )
+                        elif search_mode == "priv_lat":
+                            print(
+                                f"pci: priv-lat+force f_des={f_des:.2f}N frames={n_search} "
+                                f"lat_step={priv_lat_step*1e3:.2f}mm axis_ff={priv_lat_axis_ff:.2f} "
+                                f"lat0={feat_sp0.lateral_m*1e3:.1f}mm pre_lat={pre_lat_n}",
+                                flush=True,
+                            )
+                        elif search_mode == "lissajous":
+                            print(
+                                f"pci: tip-lissajous+force f_des={f_des:.2f}N frames={n_search} "
+                                f"wx={lis_wx:.2f} wy={lis_wy:.2f} shrink={int(lis_shrink)} "
+                                f"lat0={feat_sp0.lateral_m*1e3:.1f}mm center=socket "
+                                f"pre_lat={pre_lat_n} (firm grasp)",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"pci: tip-spiral+force f_des={f_des:.2f}N frames={n_sp} "
+                                f"pitch={pitch*1e3:.1f}mm track={track:.2f} "
+                                f"r0={r0*1e3:.1f} rmax={r_max*1e3:.1f} "
+                                f"lat0={feat_sp0.lateral_m*1e3:.1f}mm "
+                                f"center={spiral_center_mode} dir={spiral_dir} "
+                                f"shrink={int(lat_shrink_only)} pre_lat={pre_lat_n} "
+                                f"(firm grasp)",
+                                flush=True,
+                            )
+                        if pre_lat_n > 0:
+                            for pre_lat_used in range(1, pre_lat_n + 1):
+                                feat_i = features_from_raw(raw)
+                                site_now = actual_action44_from_sites(raw)
+                                tip = np.asarray(
+                                    feat_i.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                ax_i = feat_i.hole_axis / (
+                                    np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                )
+                                off_xy = _tip_lat_offset_xy(
+                                    tip, pre_lat_axis, feat_i.hole_axis
+                                )
+                                dist = float(np.linalg.norm(off_xy))
+                                if float(feat_i.lateral_m) <= mouth_lat:
+                                    print(
+                                        f"pci: pre-lat done j={pre_lat_used} "
+                                        f"lat={feat_i.lateral_m*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                                step_v = -off_xy * (
+                                    min(pre_lat_step, dist) / (dist + 1e-12)
+                                )
+                                target = tip + step_v
+                                err = target - tip
+                                err = err - ax_i * float(np.dot(err, ax_i))
+                                contact, left_c, fz_r, fz_l = _wrist_contact()
+                                contact_sp = float(contact)
+                                spiral_resid_peak = max(spiral_resid_peak, contact_sp)
+                                err_f = f_des - contact_sp
+                                ax_step = float(
+                                    np.clip(kp * err_f, -max_step, max_step)
+                                )
+                                if err_f < 0.0:
+                                    ax_step = float(
+                                        np.clip(
+                                            kp * unload_boost * err_f,
+                                            -max_step * unload_boost,
+                                            max_step,
+                                        )
+                                    )
+                                site_xyz = site_now[0:3].copy()
+                                offset_wt = (
+                                    offset_wt0_sp
+                                    if freeze_off
+                                    else site_xyz - tip
+                                )
+                                hold_r = target + offset_wt + press_ax * ax_step
+                                d_cmd = hold_r - site_xyz
+                                dn = float(np.linalg.norm(d_cmd))
+                                max_cmd = float(
+                                    a_cfg.get(
+                                        "surface_tip_spiral_max_wrist_step_m", 0.008
+                                    )
+                                )
+                                if dn > max_cmd > 0.0:
+                                    hold_r = site_xyz + d_cmd * (max_cmd / dn)
+                                cmd = np.zeros(44, dtype=np.float64)
+                                cmd[0:6] = site_now[0:6].copy()
+                                cmd[0:3] = hold_r
+                                cmd[6:22] = hold_r_hand
+                                cmd[22:28] = hold_l
+                                cmd[28:44] = hold_l_hand
+                                step_action44(
+                                    gym_env, cmd, ego_recorder=ego_recorder
+                                )
+                                feat_after = features_from_raw(raw)
+                                force_trace.append(
+                                    {
+                                        "t": float(t_force) * dt_f,
+                                        "step": float(t_force),
+                                        "phase": "pre_lat",
+                                        "resid_r": float(contact_sp),
+                                        "resid_l": float(left_c),
+                                        "fz_r": float(fz_r),
+                                        "fz_l": float(fz_l),
+                                        "lat_mm": float(feat_after.lateral_m)
+                                        * 1000.0,
+                                        "along_mm": float(feat_after.along_m)
+                                        * 1000.0,
+                                        "f_des": float(f_des),
+                                    }
+                                )
+                                t_force += 1
+                                spiral_lat_min = min(
+                                    spiral_lat_min, float(feat_after.lateral_m)
+                                )
+                                if _grasp_lost():
+                                    spiral_reason = "grasp_slip"
+                                    meta["grasp_abort_phase"] = "pre_lat"
+                                    break
+                            steps += int(pre_lat_used)
+                            meta["spiral_pre_lat_frames"] = int(pre_lat_used)
+                            if spiral_reason == "grasp_slip":
+                                meta["spiral_frames"] = 0
+                                meta["spiral_reason"] = spiral_reason
+                                gate = _priv_tip_spiral_gate(meta, cfg)
+                                meta["priv_tip_spiral_gate"] = gate
+                                return steps, "priv_tip_spiral_gate_fail", meta
+                            feat_sp0 = features_from_raw(raw)
+                            tip_sp0 = np.asarray(
+                                feat_sp0.tip_pos, dtype=np.float64
+                            ).reshape(3)
+                            off0_xy = _tip_lat_offset_xy(
+                                tip_sp0, spiral_center, feat_sp0.hole_axis
+                            )
+                            r_start = float(np.linalg.norm(off0_xy))
+                            theta_sp = (
+                                float(
+                                    np.arctan2(
+                                        float(off0_xy @ t2), float(off0_xy @ t1)
+                                    )
+                                )
+                                if r_start > 1e-9
+                                else 0.0
+                            )
+                            if spiral_center_mode == "socket" and r_start > r0:
+                                r0 = r_start
+                            if search_mode == "lissajous":
+                                lat0_lis = float(feat_sp0.lateral_m)
+                                if lis_ax0 <= 0.0:
+                                    lis_ax0 = max(lat0_lis, r_start, lis_amin)
+                                if lis_ay0 <= 0.0:
+                                    lis_ay0 = lis_ax0 * lis_ay_ratio
+                        used_sp = 0
+                        r_cmd = 0.0
+                        for used_sp in range(1, max(0, n_search) + 1):
+                            feat_i = features_from_raw(raw)
+                            site_now = actual_action44_from_sites(raw)
+                            tip = np.asarray(feat_i.tip_pos, dtype=np.float64).reshape(3)
+                            ax_i = feat_i.hole_axis / (
+                                np.linalg.norm(feat_i.hole_axis) + 1e-12
+                            )
+                            theta_sp = theta_sp + dtheta
+                            turn = theta_sp / (2.0 * np.pi)
+                            center_i = _hole_axis_point_at_tip(
+                                tip, feat_i.socket_pos, feat_i.hole_axis
+                            )
+                            ax_j = 0.0
+                            ay_j = 0.0
+                            f_des_step = float(f_des)
+                            stick_active = False
+                            d_stick = np.zeros(3, dtype=np.float64)
+                            if search_mode in _priv_lat_modes:
+                                d_in = _priv_lat_inward_delta(
+                                    tip,
+                                    center_i,
+                                    feat_i.hole_axis,
+                                    feat_i.peg_axis,
+                                    step_m=priv_lat_step,
+                                    axis_ff_gain=priv_lat_axis_ff,
+                                )
+                                d_liss = np.zeros(3, dtype=np.float64)
+                                if search_mode == "priv_lat_lissajous":
+                                    lat_i = float(feat_i.lateral_m)
+                                    dith_s = float(
+                                        np.clip(
+                                            priv_dith_lat0 / max(lat_i, 1e-9),
+                                            0.15,
+                                            1.0,
+                                        )
+                                    )
+                                    ph = float(used_sp)
+                                    d_liss = dith_s * (
+                                        priv_dith_ax
+                                        * np.sin(lis_wx * ph)
+                                        * t1
+                                        + priv_dith_ay
+                                        * np.sin(lis_wy * ph + lis_phi)
+                                        * t2
+                                    )
+                                tip_hist_sp.append(tip.copy())
+                                if len(tip_hist_sp) > max(2, stick_win):
+                                    tip_hist_sp[:] = tip_hist_sp[-stick_win:]
+                                if stick_phase == "search":
+                                    if (
+                                        stick_enable
+                                        and len(tip_hist_sp) >= stick_win
+                                        and float(feat_i.lateral_m) > mouth_lat
+                                    ):
+                                        d_tip_w = tip_hist_sp[-1] - tip_hist_sp[0]
+                                        tip_plan = float(
+                                            np.linalg.norm(
+                                                d_tip_w
+                                                - ax_i * float(np.dot(d_tip_w, ax_i))
+                                            )
+                                        )
+                                        if tip_plan < stick_tip_m:
+                                            stick_active = True
+                                            stick_count += 1
+                                            stick_streak += 1
+                                            stick_phase = "lift"
+                                            stick_phase_i = 0
+                                            stick_lat_enter = float(feat_i.lateral_m)
+                                            stick_along0 = float(feat_i.along_m)
+                                        else:
+                                            stick_streak = 0
+                                    else:
+                                        stick_streak = 0
+                                else:
+                                    stick_active = True
+                                    stick_count += 1
+                                    stick_streak += 1
+                                target = tip + d_in + d_liss
+                                if priv_lat_along_hold and stick_phase == "search":
+                                    if along_hold_m is None:
+                                        along_hold_m = min(
+                                            float(feat_i.along_m),
+                                            priv_lat_along_hold_max,
+                                        )
+                                    d_move = target - tip
+                                    d_ax = float(np.dot(d_move, press_ax))
+                                    if d_ax > 0.0 or float(feat_i.along_m) > along_hold_m:
+                                        target = tip + d_move - press_ax * max(
+                                            0.0, d_ax
+                                        )
+                                r_cmd = float(feat_i.lateral_m)
+                                ax_j = float(np.linalg.norm(d_in)) * 1000.0
+                                ay_j = float(np.linalg.norm(d_liss)) * 1000.0
+                            elif search_mode == "lissajous":
+                                if lis_shrink and n_search > 1:
+                                    frac = max(
+                                        0.0, 1.0 - float(used_sp - 1) / float(n_search - 1)
+                                    )
+                                    lo = lis_amin / max(lis_ax0, 1e-9)
+                                    scale = lo + (1.0 - lo) * frac
+                                else:
+                                    scale = 1.0
+                                ax_j = lis_ax0 * scale
+                                ay_j = lis_ay0 * scale
+                                ph = float(used_sp)
+                                target = spiral_center + ax_j * np.sin(
+                                    lis_wx * ph
+                                ) * t1 + ay_j * np.sin(lis_wy * ph + lis_phi) * t2
+                                r_cmd = float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            target, spiral_center, feat_i.hole_axis
+                                        )
+                                    )
+                                )
+                            elif spiral_dir == "inward":
+                                r_cmd = max(r_min, r0 - pitch * turn)
+                                target = spiral_center + r_cmd * (
+                                    np.cos(theta_sp) * t1 + np.sin(theta_sp) * t2
+                                )
+                            else:
+                                r_cmd = min(r_max, r0 + pitch * turn)
+                                target = spiral_center + r_cmd * (
+                                    np.cos(theta_sp) * t1 + np.sin(theta_sp) * t2
+                                )
+                            err = target - tip
+                            # Keep axial for stick lift/slide; planar-only for normal search.
+                            if stick_phase == "search":
+                                err = err - ax_i * float(np.dot(err, ax_i))
+                            if (
+                                stick_phase == "search"
+                                and (
+                                    lat_shrink_only
+                                    or search_mode
+                                    in (
+                                        "lissajous",
+                                        *_priv_lat_modes,
+                                    )
+                                )
+                            ):
+                                off_xy = _tip_lat_offset_xy(
+                                    tip, spiral_center, feat_i.hole_axis
+                                )
+                                dist = float(np.linalg.norm(off_xy))
+                                if dist > 1e-9:
+                                    radial_u = off_xy / dist
+                                    outward = float(np.dot(err, radial_u))
+                                    if outward > 0.0:
+                                        err = err - radial_u * outward
+                            en = float(np.linalg.norm(err))
+                            # Allow larger chase when tip lags spiral (sticky surface).
+                            step_lim = max_xy
+                            if en > 0.004 or stick_phase != "search":
+                                step_lim = max(max_xy, 0.006)
+                            if stick_phase == "slide":
+                                step_lim = max(step_lim, stick_slide_step)
+                            if en > step_lim > 0.0:
+                                err = err * (step_lim / en)
+                            d_xy = err * track
+                            contact, left_c, fz_r, fz_l = _wrist_contact()
+                            contact_sp = float(contact)
+                            spiral_resid_peak = max(spiral_resid_peak, contact_sp)
+                            if search_mode in _priv_lat_modes and stick_phase != "search":
+                                d_stick, f_des_step, next_ph, want_live = (
+                                    _tip_stick_fsm_delta(
+                                        phase=stick_phase,
+                                        tip_pos=tip,
+                                        center=center_i,
+                                        hole_axis=feat_i.hole_axis,
+                                        peg_axis=feat_i.peg_axis,
+                                        press_ax=press_ax,
+                                        contact_n=contact_sp,
+                                        f_des=f_des,
+                                        phase_i=stick_phase_i,
+                                        lift_frames=stick_lift_frames,
+                                        slide_frames=stick_slide_frames,
+                                        slide_step_m=stick_slide_step,
+                                        clear_lift_m=stick_clear_lift,
+                                        clear_contact_n=stick_clear_n,
+                                        mouth_lat_m=mouth_lat,
+                                        lat_enter_m=stick_lat_enter,
+                                    )
+                                )
+                                target = tip + d_stick
+                                # Cap along drift while unsticking (don't float away).
+                                if stick_along0 is not None:
+                                    along_now = float(feat_i.along_m)
+                                    if along_now > stick_along0 + 0.008:
+                                        target = target + press_ax * min(
+                                            0.0015, along_now - stick_along0 - 0.005
+                                        )
+                                # Track best lat; stall → re-lift with refreshed tip-servo offset.
+                                lat_now = float(feat_i.lateral_m)
+                                if stick_phase == "slide":
+                                    if lat_now < stick_lat_best - 0.0005:
+                                        stick_lat_best = lat_now
+                                        stick_stall = 0
+                                        # Refresh frozen offset as tip actually moves.
+                                        stick_offset_wt = site_now[0:3].copy() - tip
+                                    else:
+                                        stick_stall += 1
+                                    if stick_stall >= 35 and lat_now > mouth_lat * 1.25:
+                                        next_ph = "lift"
+                                        stick_stall = 0
+                                stick_phase_i += 1
+                                if next_ph != stick_phase:
+                                    if stick_phase == "lift" and next_ph == "slide":
+                                        stick_offset_wt = (
+                                            site_now[0:3].copy() - tip
+                                        )
+                                        stick_lat_enter = min(
+                                            stick_lat_enter, lat_now
+                                        )
+                                        stick_lat_best = lat_now
+                                        stick_stall = 0
+                                    if next_ph == "mouth":
+                                        stick_reached_mouth = True
+                                        stick_phase = "mouth"
+                                        stick_phase_i = 0
+                                    elif next_ph == "search":
+                                        stick_streak = 0
+                                        tip_hist_sp.clear()
+                                        stick_offset_wt = None
+                                        stick_along0 = None
+                                        stick_phase = next_ph
+                                        stick_phase_i = 0
+                                    else:
+                                        stick_phase = next_ph
+                                        stick_phase_i = 0
+                                stick_live_off = bool(want_live)
+                                stick_active = True
+                                if stick_reached_mouth or (
+                                    lat_now <= mouth_lat * 1.25
+                                    and stick_phase in ("slide", "mouth", "retouch")
+                                ):
+                                    stick_reached_mouth = True
+                                    spiral_reason = "near_mouth"
+                                    print(
+                                        f"pci: stick FSM reached mouth "
+                                        f"lat={lat_now*1e3:.1f}mm "
+                                        f"along={feat_i.along_m*1e3:.1f}mm "
+                                        f"tip_xy_peak={tip_xy_peak*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                            elif search_mode in _priv_lat_modes and stick_active:
+                                stick_live_off = True
+                                f_des_step = min(float(f_des), 0.03)
+                            else:
+                                stick_live_off = False
+                            err_f = f_des_step - contact_sp
+                            ax_step = float(np.clip(kp * err_f, -max_step, max_step))
+                            if err_f < 0.0:
+                                ax_step = float(
+                                    np.clip(
+                                        kp * unload_boost * err_f,
+                                        -max_step * unload_boost,
+                                        max_step,
+                                    )
+                                )
+                            # Extra unload when stuck with pose error.
+                            if stick_phase != "search" and contact_sp > f_des_step:
+                                ax_step = min(
+                                    ax_step,
+                                    -max_step * unload_boost,
+                                )
+                            # Lift/slide: never press into surface (breaks clear-then-slide).
+                            if stick_phase in ("lift", "slide"):
+                                ax_step = min(0.0, ax_step)
+                            # Wrist := tip_target + offset.
+                            site_xyz = site_now[0:3].copy()
+                            if stick_phase == "slide" and stick_offset_wt is not None:
+                                offset_wt = stick_offset_wt
+                            elif (
+                                freeze_off
+                                and (not stick_live_off)
+                                and stick_phase == "search"
+                            ):
+                                offset_wt = offset_wt0_sp
+                            else:
+                                offset_wt = site_xyz - tip
+                            hold_r = target + offset_wt + press_ax * ax_step
+                            d_cmd = hold_r - site_xyz
+                            dn = float(np.linalg.norm(d_cmd))
+                            max_cmd = float(
+                                a_cfg.get("surface_tip_spiral_max_wrist_step_m", 0.008)
+                            )
+                            if stick_phase == "slide":
+                                max_cmd = max(
+                                    max_cmd,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_priv_lat_stick_wrist_step_m",
+                                            0.014,
+                                        )
+                                    ),
+                                )
+                            elif stick_phase != "search":
+                                max_cmd = max(
+                                    max_cmd,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_priv_lat_stick_wrist_step_m",
+                                            0.012,
+                                        )
+                                    ),
+                                )
+                            # If tip lags commanded spiral radius, push harder.
+                            tip_off_xy = _tip_lat_offset_xy(
+                                tip, spiral_center, feat_i.hole_axis
+                            )
+                            tip_r_now = float(np.linalg.norm(tip_off_xy))
+                            cmd_off = _tip_lat_offset_xy(
+                                target, spiral_center, feat_i.hole_axis
+                            )
+                            cmd_r = float(np.linalg.norm(cmd_off))
+                            if (
+                                search_mode in ("lissajous", *_priv_lat_modes)
+                                or spiral_dir == "inward"
+                            ):
+                                if tip_r_now - cmd_r > 0.003:
+                                    max_cmd = max(
+                                        max_cmd,
+                                        float(
+                                            a_cfg.get(
+                                                "surface_tip_spiral_boost_wrist_step_m",
+                                                0.012,
+                                            )
+                                        ),
+                                    )
+                            elif r_cmd - tip_r_now > 0.003:
+                                max_cmd = max(
+                                    max_cmd,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_tip_spiral_boost_wrist_step_m",
+                                            0.012,
+                                        )
+                                    ),
+                                )
+                            if dn > max_cmd > 0.0:
+                                hold_r = site_xyz + d_cmd * (max_cmd / dn)
+                            hold_l[0:3] = site_now[22:25].copy() + d_xy * left_share_sp
+                            cmd = np.zeros(44, dtype=np.float64)
+                            cmd[0:6] = site_now[0:6].copy()
+                            cmd[0:3] = hold_r
+                            cmd[6:22] = hold_r_hand
+                            cmd[22:28] = hold_l
+                            cmd[28:44] = hold_l_hand
+                            step_action44(gym_env, cmd, ego_recorder=ego_recorder)
+                            feat_after_sp = features_from_raw(raw)
+                            tip_a = np.asarray(
+                                feat_after_sp.tip_pos, dtype=np.float64
+                            ).reshape(3)
+                            d_tip = tip_a - tip_sp0
+                            tip_xy = float(
+                                np.linalg.norm(d_tip - ax_i * float(np.dot(d_tip, ax_i)))
+                            )
+                            tip_xy_peak = max(tip_xy_peak, tip_xy)
+                            if search_mode in _priv_lat_modes:
+                                phase_name = str(search_mode)
+                            elif search_mode == "lissajous":
+                                phase_name = "lissajous"
+                            else:
+                                phase_name = "spiral"
+                            force_trace.append(
+                                {
+                                    "t": float(t_force) * dt_f,
+                                    "step": float(t_force),
+                                    "phase": phase_name,
+                                    "resid_r": float(contact_sp),
+                                    "resid_l": float(left_c),
+                                    "fz_r": float(fz_r),
+                                    "fz_l": float(fz_l),
+                                    "lat_mm": float(feat_after_sp.lateral_m) * 1000.0,
+                                    "along_mm": float(feat_after_sp.along_m) * 1000.0,
+                                    "f_des": float(f_des_step),
+                                    "spiral_resid": float(contact_sp),
+                                    "tip_xy_mm": float(tip_xy) * 1000.0,
+                                    "spiral_r_mm": float(r_cmd) * 1000.0,
+                                    "spiral_theta": float(theta_sp),
+                                    "stick": int(stick_active),
+                                    "stick_lift_mm": float(np.linalg.norm(d_stick))
+                                    * 1000.0,
+                                    "liss_ax_mm": float(ax_j) * 1000.0
+                                    if search_mode == "lissajous"
+                                    else 0.0,
+                                    "liss_ay_mm": float(ay_j) * 1000.0
+                                    if search_mode == "lissajous"
+                                    else 0.0,
+                                }
+                            )
+                            t_force += 1
+                            tilt_i = _tray_tilt_entry_deg()
+                            phase_a_tilt_peak = max(phase_a_tilt_peak, tilt_i)
+                            phase_a_peg_tilt_peak = max(
+                                phase_a_peg_tilt_peak, _peg_tilt_entry_deg()
+                            )
+                            spiral_lat_min = min(
+                                spiral_lat_min, float(feat_after_sp.lateral_m)
+                            )
+                            out_i = env._labeler.compute(raw)
+                            if _grasp_lost():
+                                spiral_reason = "grasp_slip"
+                                print(
+                                    f"pci: tip-spiral ABORT grasp_slip="
+                                    f"{grasp_slip_peak*1e3:.1f}mm "
+                                    f"> {grasp_slip_lim*1e3:.1f}mm j={used_sp}",
+                                    flush=True,
+                                )
+                                meta["grasp_abort_phase"] = "spiral"
+                                break
+                            if (not out_i.tray_ok) or tilt_i > max_tilt_sp:
+                                spiral_reason = "spiral_tilt_or_tray"
+                                print(
+                                    f"pci: tip-spiral abort tilt={tilt_i:.1f}deg "
+                                    f"tray_ok={int(bool(out_i.tray_ok))} j={used_sp}",
+                                    flush=True,
+                                )
+                                break
+                            if (
+                                float(feat_after_sp.lateral_m) <= mouth_lat
+                                and float(feat_after_sp.along_m) <= 0.105
+                            ):
+                                if mouth_continue:
+                                    if used_sp == 1 or used_sp % 30 == 0:
+                                        print(
+                                            f"pci: near mouth continue search "
+                                            f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                            f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                else:
+                                    spiral_reason = "near_mouth"
+                                    print(
+                                        f"pci: tip-spiral near mouth "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"|r|={contact_sp:.2f}N tip_xy={tip_xy*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                            if used_sp % 30 == 0 or used_sp == 1:
+                                if search_mode in _priv_lat_modes:
+                                    print(
+                                        f"pci: {search_mode} j={used_sp} |r|={contact_sp:.2f}N "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"axis={feat_after_sp.axis_error_rad*180/np.pi:.1f}deg "
+                                        f"din={ax_j:.2f}mm dith={ay_j:.2f}mm "
+                                        f"tip_xy={tip_xy*1e3:.1f}mm tilt={tilt_i:.1f}deg "
+                                        f"stick={stick_phase} "
+                                        f"f_des={f_des_step:.2f}N",
+                                        flush=True,
+                                    )
+                                elif search_mode == "lissajous":
+                                    print(
+                                        f"pci: tip-lissajous j={used_sp} |r|={contact_sp:.2f}N "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"ax={ax_j*1e3:.1f} ay={ay_j*1e3:.1f}mm "
+                                        f"tip_xy={tip_xy*1e3:.1f}mm tilt={tilt_i:.1f}deg",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"pci: tip-spiral j={used_sp} |r|={contact_sp:.2f}N "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"θ={theta_sp:.1f} r={r_cmd*1e3:.1f}mm "
+                                        f"tip_xy={tip_xy*1e3:.1f}mm tilt={tilt_i:.1f}deg",
+                                        flush=True,
+                                    )
+                        steps += used_sp
+                        mouth_wiggle_used = 0
+                        mouth_wiggle_ok = False
+                        mouth_tip_xy_peak = 0.0
+                        mouth_wiggle_reason = "skip"
+                        if mouth_wiggle_enable and spiral_reason != "grasp_slip":
+                            feat_m0 = features_from_raw(raw)
+                            run_mouth = (
+                                spiral_reason == "near_mouth"
+                                or bool(stick_reached_mouth)
+                                or float(feat_m0.lateral_m) <= mouth_lat * 2.5
+                            )
+                            if run_mouth and n_mouth > 0:
+                                mouth_wiggle_reason = "run"
+                                tip_m0 = np.asarray(
+                                    feat_m0.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                along_m0 = float(feat_m0.along_m)
+                                tip_dist_m0 = float(feat_m0.tip_socket_dist_m)
+                                jam_streak = 0
+                                jam_mode = False
+                                # Freeze wrist-tip offset at mouth entry (after stick
+                                # slide). Never reuse spiral-start offset_wt0_sp —
+                                # tip may have moved tens of mm.
+                                site_m0 = actual_action44_from_sites(raw)
+                                if stick_offset_wt is not None:
+                                    mouth_offset_wt = stick_offset_wt.copy()
+                                else:
+                                    mouth_offset_wt = (
+                                        site_m0[0:3].copy() - tip_m0
+                                    )
+                                mouth_lat_best = float(feat_m0.lateral_m)
+                                mouth_along_best = float(feat_m0.along_m)
+                                mouth_along_stall = 0
+                                mouth_wrist_step = float(
+                                    a_cfg.get(
+                                        "surface_priv_lat_stick_wrist_step_m",
+                                        0.014,
+                                    )
+                                )
+                                print(
+                                    f"pci: mouth-wiggle start frames={n_mouth} "
+                                    f"lat={feat_m0.lateral_m*1e3:.1f}mm "
+                                    f"along={feat_m0.along_m*1e3:.1f}mm "
+                                    f"tray_admit={mouth_tray_admit:.2f}",
+                                    flush=True,
+                                )
+                                for mouth_wiggle_used in range(1, n_mouth + 1):
+                                    feat_i = features_from_raw(raw)
+                                    site_now = actual_action44_from_sites(raw)
+                                    tip = np.asarray(
+                                        feat_i.tip_pos, dtype=np.float64
+                                    ).reshape(3)
+                                    ax_i = feat_i.hole_axis / (
+                                        np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                    )
+                                    center_i = _hole_axis_point_at_tip(
+                                        tip,
+                                        feat_i.socket_pos,
+                                        feat_i.hole_axis,
+                                    )
+                                    lat_now_i = float(feat_i.lateral_m)
+                                    along_now_i = float(feat_i.along_m)
+                                    # Absolute tip → hole axis; only push depth once
+                                    # lat is tight (else rim-jam at ~98mm like ep1).
+                                    tip_goal = np.asarray(
+                                        center_i, dtype=np.float64
+                                    ).reshape(3)
+                                    lat_seat = max(float(mouth_lat) * 0.85, 0.0035)
+                                    # Already near bore: keep seating even if lat wobbles.
+                                    if along_now_i <= 0.095:
+                                        lat_seat = max(lat_seat, float(mouth_lat) * 1.2)
+                                    if lat_now_i <= lat_seat or along_now_i <= 0.094:
+                                        seat = float(
+                                            np.clip(
+                                                (along_now_i - 0.085) * 0.65,
+                                                0.002,
+                                                0.016,
+                                            )
+                                        )
+                                        if along_now_i <= 0.094:
+                                            seat = max(seat, 0.004)
+                                        tip_goal = tip_goal + press_ax * seat
+                                    d_abs = tip_goal - tip
+                                    if lat_now_i > lat_seat and along_now_i > 0.094:
+                                        # Far / mid: planar-only chase first.
+                                        d_abs = d_abs - ax_i * float(
+                                            np.dot(d_abs, ax_i)
+                                        )
+                                    dn_abs = float(np.linalg.norm(d_abs))
+                                    slide_cap = max(
+                                        float(
+                                            a_cfg.get(
+                                                "surface_priv_lat_stick_slide_step_m",
+                                                0.008,
+                                            )
+                                        ),
+                                        0.008,
+                                    )
+                                    if lat_now_i <= lat_seat:
+                                        slide_cap = max(slide_cap, 0.012)
+                                    if dn_abs > slide_cap > 0.0:
+                                        d_abs = d_abs * (slide_cap / dn_abs)
+                                    # Tiny dither only once lat is already near mouth.
+                                    ph = float(mouth_wiggle_used)
+                                    d_wig = mouth_xy_m * (
+                                        np.sin(mouth_wx * ph) * t1
+                                        + np.sin(mouth_wy * ph + mouth_phi) * t2
+                                    )
+                                    if lat_now_i > mouth_lat * 1.5:
+                                        d_wig = d_wig * 0.15
+                                    elif lat_now_i <= lat_seat:
+                                        d_wig = d_wig * 0.35
+                                    d_in_n = dn_abs
+                                    d_wig_n = float(np.linalg.norm(d_wig))
+                                    # Light press for force contact / chamfer seat.
+                                    press_m = max(mouth_ax_step, 0.00008)
+                                    if lat_now_i <= lat_seat or along_now_i <= 0.094:
+                                        press_m = max(press_m, 0.0004)
+                                    elif lat_now_i <= mouth_lat * 1.25:
+                                        # Still recentering: tiny contact only.
+                                        press_m = min(press_m, 0.00005)
+                                    if along_now_i <= 0.092:
+                                        # Lock depth: kill dither that knocks tip out.
+                                        d_wig = d_wig * 0.05
+                                        press_m = max(press_m, 0.00055)
+                                        # Prefer axial over further lateral chase.
+                                        d_plan = d_abs - ax_i * float(
+                                            np.dot(d_abs, ax_i)
+                                        )
+                                        d_ax_only = press_ax * float(
+                                            np.dot(d_abs, press_ax)
+                                        )
+                                        if float(np.dot(d_abs, press_ax)) < 0.0:
+                                            d_ax_only = press_ax * 0.004
+                                        d_abs = 0.25 * d_plan + d_ax_only
+                                    if jam_mode:
+                                        press_m = -mouth_ax_step * 2.0
+                                    target = tip + d_abs + 0.25 * d_wig + press_ax * press_m
+                                    # Cap along float-away (don't climb out).
+                                    if along_now_i > along_m0 + 0.004:
+                                        target = target + press_ax * min(
+                                            0.002, along_now_i - along_m0
+                                        )
+                                    off_xy = _tip_lat_offset_xy(
+                                        tip, center_i, feat_i.hole_axis
+                                    )
+                                    dist = float(np.linalg.norm(off_xy))
+                                    d_xy = d_abs * track
+                                    contact, left_c, fz_r, fz_l = _wrist_contact()
+                                    contact_sp = float(contact)
+                                    spiral_resid_peak = max(
+                                        spiral_resid_peak, contact_sp
+                                    )
+                                    jam_thresh = float(mouth_jam_fxy)
+                                    if lat_now_i <= mouth_lat * 1.5:
+                                        # Chamfer seating contact is expected; don't jam-lock.
+                                        jam_thresh = max(jam_thresh, 1.6)
+                                    if contact_sp >= jam_thresh:
+                                        jam_streak += 1
+                                    else:
+                                        jam_streak = 0
+                                    jam_mode = jam_streak >= mouth_jam_frames
+                                    # Near-mouth jam hop: brief unload → planar recenter → press.
+                                    if (
+                                        jam_mode
+                                        and lat_now_i <= mouth_lat * 1.75
+                                        and along_now_i > 0.092
+                                    ):
+                                        hop = int(mouth_wiggle_used) % 30
+                                        if hop < 8:
+                                            target = tip + (-press_ax) * 0.00055 + 0.2 * d_abs
+                                        elif hop < 18:
+                                            target = tip + d_abs + 0.5 * d_wig
+                                        else:
+                                            target = tip + d_abs + press_ax * 0.00045
+                                        jam_mode = hop < 8  # only unload on lift half
+                                    # Along stall on rim: forced hop even without force-jam.
+                                    along_stall_hop = False
+                                    if along_now_i < mouth_along_best - 0.0004:
+                                        mouth_along_best = along_now_i
+                                        mouth_along_stall = 0
+                                    else:
+                                        mouth_along_stall += 1
+                                    if (
+                                        mouth_along_stall >= 35
+                                        and lat_now_i <= mouth_lat * 1.75
+                                        and along_now_i > 0.096
+                                    ):
+                                        along_stall_hop = True
+                                        hop = int(mouth_along_stall) % 36
+                                        live_off = site_now[0:3].copy() - tip
+                                        if hop < 10:
+                                            target = tip + (-press_ax) * 0.0008
+                                            mouth_offset_wt = live_off
+                                        elif hop < 22:
+                                            target = tip + d_abs * 1.2
+                                            mouth_offset_wt = live_off
+                                        else:
+                                            target = tip + d_abs + press_ax * 0.0006
+                                        if hop == 35:
+                                            mouth_along_stall = 0
+
+                                    # Prefer light contact; unload hard jam.
+                                    f_mouth = min(float(f_des), 0.08)
+                                    if lat_now_i <= mouth_lat * 1.25 and not jam_mode:
+                                        f_mouth = max(f_mouth, 0.35)
+                                    err_f = f_mouth - contact_sp
+                                    ax_step = float(
+                                        np.clip(kp * err_f, -max_step, max_step)
+                                    )
+                                    if err_f < 0.0:
+                                        ax_step = float(
+                                            np.clip(
+                                                kp * unload_boost * err_f,
+                                                -max_step * unload_boost,
+                                                max_step,
+                                            )
+                                        )
+                                    # Seating into mouth: never unload tip back out
+                                    # (was stuck ~98mm while force loop retracted).
+                                    if (
+                                        lat_now_i <= mouth_lat * 1.5
+                                        and along_now_i > 0.090
+                                        and contact_sp < 2.2
+                                        and not jam_mode
+                                    ):
+                                        ax_step = max(0.0, ax_step)
+                                    if along_stall_hop:
+                                        ax_step = 0.0
+                                    site_xyz = site_now[0:3].copy()
+                                    # Refresh frozen offset when tip actually moves in.
+                                    if lat_now_i < mouth_lat_best - 0.0005:
+                                        mouth_lat_best = lat_now_i
+                                        mouth_offset_wt = site_xyz - tip
+                                    # If lat blows out, force live offset so tip follows.
+                                    if lat_now_i > mouth_lat * 2.0:
+                                        mouth_offset_wt = site_xyz - tip
+                                    # Seating: always live offset so axial tip chase works
+                                    # (frozen offset after stick slide often kills Z push).
+                                    if (
+                                        lat_now_i <= mouth_lat * 1.75
+                                        and along_now_i > 0.090
+                                    ):
+                                        offset_wt = site_xyz - tip
+                                    else:
+                                        offset_wt = mouth_offset_wt
+                                    hold_r = target + offset_wt + press_ax * ax_step
+                                    d_cmd = hold_r - site_xyz
+                                    dn = float(np.linalg.norm(d_cmd))
+                                    max_cmd = max(mouth_wrist_step, 0.012)
+                                    if (
+                                        lat_now_i <= mouth_lat * 1.5
+                                        and along_now_i > 0.090
+                                    ):
+                                        max_cmd = max(max_cmd, 0.018)
+                                    if dn > max_cmd > 0.0:
+                                        hold_r = site_xyz + d_cmd * (max_cmd / dn)
+                                    hold_l[0:3] = site_now[22:25].copy() + d_xy * left_share_sp
+                                    if mouth_tray_admit > 0.0 and dist > 1e-9:
+                                        admit = min(
+                                            mouth_tray_admit * mouth_lat_step,
+                                            mouth_tray_admit_max,
+                                        )
+                                        hold_l[0:3] = site_now[22:25].copy() - off_xy / dist * admit
+                                    cmd = np.zeros(44, dtype=np.float64)
+                                    cmd[0:6] = site_now[0:6].copy()
+                                    cmd[0:3] = hold_r
+                                    cmd[6:22] = hold_r_hand
+                                    cmd[22:28] = hold_l
+                                    cmd[28:44] = hold_l_hand
+                                    step_action44(
+                                        gym_env, cmd, ego_recorder=ego_recorder
+                                    )
+                                    feat_after_m = features_from_raw(raw)
+                                    tip_a = np.asarray(
+                                        feat_after_m.tip_pos, dtype=np.float64
+                                    ).reshape(3)
+                                    d_tip = tip_a - tip_m0
+                                    tip_xy_m = float(
+                                        np.linalg.norm(
+                                            d_tip - ax_i * float(np.dot(d_tip, ax_i))
+                                        )
+                                    )
+                                    mouth_tip_xy_peak = max(
+                                        mouth_tip_xy_peak, tip_xy_m
+                                    )
+                                    tip_xy_peak = max(tip_xy_peak, tip_xy_m)
+                                    force_trace.append(
+                                        {
+                                            "t": float(t_force) * dt_f,
+                                            "step": float(t_force),
+                                            "phase": "mouth_wiggle",
+                                            "resid_r": float(contact_sp),
+                                            "resid_l": float(left_c),
+                                            "fz_r": float(fz_r),
+                                            "fz_l": float(fz_l),
+                                            "lat_mm": float(feat_after_m.lateral_m)
+                                            * 1000.0,
+                                            "along_mm": float(feat_after_m.along_m)
+                                            * 1000.0,
+                                            "f_des": float(f_des),
+                                            "tip_xy_mm": float(tip_xy_m) * 1000.0,
+                                            "mouth_din_mm": float(d_in_n) * 1000.0,
+                                            "mouth_wig_mm": float(d_wig_n) * 1000.0,
+                                            "jam_mode": int(jam_mode),
+                                        }
+                                    )
+                                    t_force += 1
+                                    tilt_i = _tray_tilt_entry_deg()
+                                    phase_a_tilt_peak = max(phase_a_tilt_peak, tilt_i)
+                                    phase_a_peg_tilt_peak = max(
+                                        phase_a_peg_tilt_peak, _peg_tilt_entry_deg()
+                                    )
+                                    spiral_lat_min = min(
+                                        spiral_lat_min,
+                                        float(feat_after_m.lateral_m),
+                                    )
+                                    if _grasp_lost():
+                                        # Privileged mouth seat: do not abort on slip;
+                                        # gate still records peak. Only bail if tip
+                                        # fled far from the hole.
+                                        if (
+                                            float(feat_after_m.lateral_m)
+                                            > mouth_lat * 4.0
+                                            and float(feat_after_m.along_m) > 0.110
+                                        ):
+                                            mouth_wiggle_reason = "grasp_slip"
+                                            meta["grasp_abort_phase"] = "mouth_wiggle"
+                                            break
+                                        # else keep seating
+
+
+                                    out_i = env._labeler.compute(raw)
+                                    mouth_tilt_lim = max(float(max_tilt_sp), 16.0)
+                                    if (not out_i.tray_ok) or tilt_i > mouth_tilt_lim:
+                                        mouth_wiggle_reason = "mouth_tilt_or_tray"
+                                        break
+                                    along_gain = float(feat_after_m.along_m) - along_m0
+                                    tip_gain = tip_dist_m0 - float(
+                                        feat_after_m.tip_socket_dist_m
+                                    )
+                                    lat_now_m = float(feat_after_m.lateral_m)
+                                    along_now_m = float(feat_after_m.along_m)
+                                    tip_now_m = float(
+                                        feat_after_m.tip_socket_dist_m
+                                    )
+                                    # Real enter: tip/along into bore (≤91mm).
+                                    entered = (
+                                        along_now_m <= 0.091 or tip_now_m <= 0.091
+                                    )
+                                    if entered and lat_now_m <= mouth_lat * 2.0:
+                                        mouth_wiggle_reason = "mouth_insert_progress"
+                                        spiral_reason = "mouth_insert"
+                                        mouth_wiggle_ok = True
+                                        print(
+                                            f"pci: mouth-wiggle ENTER "
+                                            f"along={along_now_m*1e3:.1f}mm "
+                                            f"tip={tip_now_m*1e3:.1f}mm "
+                                            f"lat={lat_now_m*1e3:.1f}mm "
+                                            f"j={mouth_wiggle_used}",
+                                            flush=True,
+                                        )
+                                        break
+                                    # Keep pressing once lat is seated on axis.
+                                    if (
+                                        lat_now_m <= mouth_lat * 1.25
+                                        and mouth_wiggle_used > 40
+                                        and not jam_mode
+                                    ):
+                                        # Extra axial push baked into next target via
+                                        # larger press — bump mouth_ax_step locally.
+                                        mouth_ax_step = max(
+                                            mouth_ax_step, 0.00018
+                                        )
+                                    if mouth_wiggle_used % 30 == 0 or mouth_wiggle_used == 1:
+                                        print(
+                                            f"pci: mouth-wiggle j={mouth_wiggle_used} "
+                                            f"|r|={contact_sp:.2f}N jam={int(jam_mode)} "
+                                            f"lat={feat_after_m.lateral_m*1e3:.1f}mm "
+                                            f"along={feat_after_m.along_m*1e3:.1f}mm "
+                                            f"tip_xy={tip_xy_m*1e3:.1f}mm",
+                                            flush=True,
+                                        )
+                                steps += int(mouth_wiggle_used)
+                                if (
+                                    mouth_wiggle_reason == "run"
+                                    and mouth_wiggle_used >= 24
+                                    and mouth_tip_xy_peak >= 0.003
+                                ):
+                                    mouth_wiggle_ok = True
+                                if (
+                                    spiral_reason in ("spiral_timeout", "near_mouth")
+                                    and mouth_wiggle_used > 0
+                                ):
+                                    spiral_reason = (
+                                        mouth_wiggle_reason
+                                        if mouth_wiggle_reason != "run"
+                                        else "mouth_wiggle_done"
+                                    )
+                        meta["mouth_wiggle_enable"] = bool(mouth_wiggle_enable)
+                        meta["mouth_wiggle_frames"] = int(mouth_wiggle_used)
+                        meta["mouth_wiggle_ok"] = bool(mouth_wiggle_ok)
+                        meta["mouth_wiggle_reason"] = str(mouth_wiggle_reason)
+                        meta["mouth_tip_xy_peak_mm"] = float(mouth_tip_xy_peak) * 1000.0
+                        meta["priv_lat_along_hold"] = bool(priv_lat_along_hold)
+                        meta["priv_lat_stick_enable"] = bool(stick_enable)
+                        meta["priv_lat_stick_frames"] = int(stick_count)
+                        meta["priv_lat_stick_phase"] = str(stick_phase)
+                        meta["stick_reached_mouth"] = bool(stick_reached_mouth)
+                        if along_hold_m is not None:
+                            meta["priv_lat_along_hold_m"] = float(along_hold_m)
+                        if mouth_wiggle_reason == "grasp_slip":
+                            feat_s = features_from_raw(raw)
+                            out_s = env._labeler.compute(raw)
+                            meta["spiral_reason"] = "grasp_slip"
+                            meta["force_trace"] = force_trace
+                            meta["grasp_latch_ok"] = True
+                            gate = _priv_tip_spiral_gate(meta, cfg)
+                            meta["priv_tip_spiral_gate"] = gate
+                            meta.update(_final_geom_meta(feat_s, out_s, ctrl))
+                            return steps, "priv_tip_spiral_gate_fail", meta
+                        feat_s = features_from_raw(raw)
+                        out_s = env._labeler.compute(raw)
+                        meta["align_lat_mm"] = feat_s.lateral_m * 1000
+                        meta["align_along_mm"] = feat_s.along_m * 1000
+                        meta["phase_a_tray_tilt_peak_deg"] = float(phase_a_tilt_peak)
+                        meta["phase_a_peg_tilt_peak_deg"] = float(phase_a_peg_tilt_peak)
+                        meta["phase_a_rel_rot_peak_rad"] = float(phase_a_rel_peak)
+                        meta["spiral_frames"] = int(used_sp)
+                        meta["spiral_reason"] = str(spiral_reason)
+                        meta["spiral_lat_min_mm"] = float(spiral_lat_min) * 1000
+                        meta["spiral_resid_peak_n"] = float(spiral_resid_peak)
+                        meta["spiral_theta_rad"] = float(theta_sp)
+                        meta["spiral_mode"] = (
+                            str(search_mode)
+                            if search_mode in _priv_lat_modes
+                            else (
+                                "lissajous_socket"
+                                if search_mode == "lissajous"
+                                else "tip_track_firm_grasp"
+                            )
+                        )
+                        meta["search_mode"] = str(search_mode)
+                        meta["spiral_center"] = str(spiral_center_mode)
+                        meta["spiral_direction"] = str(spiral_dir)
+                        meta["spiral_lat_shrink_only"] = bool(lat_shrink_only)
+                        meta["spiral_pre_lat_frames"] = int(
+                            meta.get("spiral_pre_lat_frames", pre_lat_used)
+                        )
+                        meta["spiral_tip_xy_peak_mm"] = float(tip_xy_peak) * 1000.0
+                        meta["force_trace"] = force_trace
+                        meta["force_trace_n"] = int(len(force_trace))
+                        meta["grasp_slip_peak_m"] = float(grasp_slip_peak)
+                        meta["grasp_latch_ok"] = True
+                        gate = _priv_tip_spiral_gate(meta, cfg)
+                        meta["priv_tip_spiral_gate"] = gate
+                        meta.update(_final_geom_meta(feat_s, out_s, ctrl))
+                        print(
+                            f"pci: tip-spiral done reason={spiral_reason} "
+                            f"lat={feat_s.lateral_m*1e3:.1f}mm "
+                            f"along={feat_s.along_m*1e3:.1f}mm tip={feat_s.tip_socket_dist_m*1e3:.1f}mm "
+                            f"|r|_peak={spiral_resid_peak:.2f}N "
+                            f"tip_xy_peak={tip_xy_peak*1e3:.1f}mm "
+                            f"grasp_slip={grasp_slip_peak*1e3:.1f}mm "
+                            f"tilt={phase_a_tilt_peak:.2f}deg "
+                            f"GATE={'PASS' if gate['ok'] else 'FAIL'} "
+                            f"lift={gate['lift_ok']} spiral={gate['spiral_ok']} "
+                            f"force={gate['force_ok']} grasp={gate.get('grasp_ok')}",
+                            flush=True,
+                        )
+                        if not gate["ok"]:
+                            for rs in gate.get("reasons", []):
+                                print(f"pci: GATE fail — {rs}", flush=True)
+                        why = "surface_press" if gate["ok"] else "priv_tip_spiral_gate_fail"
+                        return steps, why, meta
                     # r24: first latch + arm Phase-A QP even if soft_contact_relatch=false.
                     if use_pose_qp:
                         latch_existing = meta.get("latch_priv_geom")
@@ -1201,8 +3988,44 @@ def run_pbvs_biased_surface_press(
                                 flush=True,
                             )
 
-            # Tip for deliver geom gate only (no mid-ALIGN hard abort).
+            # Tip for deliver geom gate; optional mid-ALIGN tip abort (scheme B).
             tilt_now = _tray_tilt_entry_deg()
+            peg_now = _peg_tilt_entry_deg()
+            abort_tray = float(a_cfg.get("align_tip_abort_deg", 0.0))
+            abort_peg = float(a_cfg.get("align_peg_abort_deg", 0.0))
+            if soft_latched and (
+                (abort_tray > 1e-6 and tilt_now > abort_tray)
+                or (abort_peg > 1e-6 and peg_now > abort_peg)
+            ):
+                # Unload then fail — do not keep soft-pressing into tipped pose.
+                n_u = int(a_cfg.get("align_abort_unload_frames", 15))
+                u_step = float(a_cfg.get("surface_resid_unload_step_m", 0.0004))
+                hole_u_ab = feat.hole_axis / (np.linalg.norm(feat.hole_axis) + 1e-12)
+                hold_ab = actual_action44_from_sites(raw)
+                for _u in range(max(0, n_u)):
+                    hold_ab = hold_ab.copy()
+                    hold_ab[0:3] = hold_ab[0:3] + hole_u_ab * u_step
+                    if getattr(ctrl, "_hold_l_hand", None) is not None:
+                        hold_ab[28:44] = np.asarray(ctrl._hold_l_hand, dtype=np.float64)
+                    step_action44(gym_env, hold_ab, ego_recorder=ego_recorder)
+                    steps += 1
+                if ctrl.active:
+                    ctrl._deactivate()  # noqa: SLF001
+                meta["align_tip_abort"] = True
+                meta["align_tip_abort_tray_deg"] = float(tilt_now)
+                meta["align_tip_abort_peg_deg"] = float(peg_now)
+                meta["phase_a_tray_tilt_peak_deg"] = float(
+                    max(phase_a_tilt_peak, tilt_now)
+                )
+                meta["phase_a_peg_tilt_peak_deg"] = float(
+                    max(phase_a_peg_tilt_peak, peg_now)
+                )
+                print(
+                    f"pci: ALIGN tip-abort tray={tilt_now:.1f}deg peg={peg_now:.1f}deg "
+                    f"— unload {n_u} then fail",
+                    flush=True,
+                )
+                return steps, "align_tip_abort", meta
 
             if contact_mag >= force_thresh:
                 # Geom gate: refuse far false-contact deliveries (r25 ep3/4 latched at along>150mm).
@@ -1236,7 +4059,10 @@ def run_pbvs_biased_surface_press(
                 contact_streak = 0
             if contact_streak >= force_confirm:
                 if _deliver_geom_ok(feat):
-                    return _deliver_surface(feat, outcome, fz=fz, d_fz=d_fz)
+                    if bool(a_cfg.get("stop_after_surface", False)):
+                        contact_streak = 0
+                    else:
+                        return _deliver_surface(feat, outcome, fz=fz, d_fz=d_fz)
                 contact_streak = 0
                 ctrl.config.pbvs_lambda_z = min(
                     float(ctrl.config.pbvs_lambda_z),
@@ -1304,6 +4130,74 @@ def run_pci_episode(
         "surface_press",
         "surface_press_but_bad_geom",
     )
+    handoff_insert = bool(
+        cfg.get("approach", {}).get("surface_handoff_insert_after_gate", False)
+    )
+    # Soft-land demo: skip settle unload (along-hole) and SEARCH.
+    if bool(cfg.get("approach", {}).get("stop_after_surface", False)) and not handoff_insert:
+        feat = features_from_raw(raw)
+        out = env._labeler.compute(raw)
+        clean = {
+            k: v
+            for k, v in dict(surface_meta).items()
+            if not str(k).startswith("_")
+            and not hasattr(v, "dtype")
+            and not isinstance(v, PrivGraspGeom)
+        }
+        clean["stop_after_surface"] = True
+        clean["stop_at_soft_contact"] = bool(surface_meta.get("stop_at_soft_contact"))
+        tilt_peak = float(surface_meta.get("phase_a_tray_tilt_peak_deg", 0.0))
+        max_tilt_ok = float(
+            cfg.get("approach", {}).get("surface_settle_max_tray_tilt_deg", 8.0)
+        )
+        gate = surface_meta.get("priv_tip_spiral_gate")
+        if not isinstance(gate, dict):
+            gate = _priv_tip_spiral_gate(surface_meta, cfg)
+            clean["priv_tip_spiral_gate"] = gate
+        tray_ok_demo = bool(out.tray_ok) and tilt_peak <= max_tilt_ok
+        surface_ok_demo = bool(tray_ok_demo and gate.get("ok") and surface_ok)
+        print(
+            f"pci: stop_after_surface — tray_ok={int(bool(out.tray_ok))} "
+            f"tilt_peak={tilt_peak:.2f}deg GATE={'PASS' if gate.get('ok') else 'FAIL'} "
+            f"lat={feat.lateral_m*1e3:.1f}mm along={feat.along_m*1e3:.1f}mm "
+            f"tip={feat.tip_socket_dist_m*1e3:.1f}mm",
+            flush=True,
+        )
+        fail_reason = ""
+        if not surface_ok_demo:
+            if align_reason == "priv_tip_spiral_gate_fail" or not gate.get("ok"):
+                fail_reason = "priv_tip_spiral_gate_fail"
+            elif not tray_ok_demo:
+                fail_reason = "surface_tilt_or_tray"
+            else:
+                fail_reason = align_reason or "surface_fail"
+        return {
+            "success": bool(surface_ok_demo),
+            "mouth_ok": False,
+            "insert_ok": False,
+            "tray_ok": bool(out.tray_ok),
+            "peg_ok": bool(out.peg_ok),
+            "fail_reason": fail_reason,
+            "align_phase": "SURFACE",
+            "align_steps": align_steps,
+            "control_steps": 0,
+            "final_phase": "SURFACE_DONE",
+            "final_tip_dist_m": feat.tip_socket_dist_m,
+            "final_lat_m": feat.lateral_m,
+            "final_along_m": feat.along_m,
+            "eval_only": True,
+            "hybrid_summary": hybrid.episode_summary(),
+            "traj_tail": [],
+            "traj": [],
+            "phase_a_mode": "pbvs_biased_surface_press",
+            "approach_noise": clean,
+            "surface_meta": clean,
+            "surface_reason": "stop_at_soft_contact",
+            "compliance": compliance_tag,
+            "priv_gate": True,
+            "priv_tip_spiral_gate": gate,
+        }
+
     if not surface_ok:
         feat = features_from_raw(raw)
         return {
@@ -2073,6 +4967,52 @@ def run_pci_episode(
         f"theory_pose_qp={theory_path})",
         flush=True,
     )
+    # Demo / audit: stop at soft-land (no SEARCH).
+    if bool(cfg.get("approach", {}).get("stop_after_surface", False)) and not handoff_insert:
+        feat_s = features_from_raw(raw)
+        out_s = env._labeler.compute(raw)
+        max_tilt_ok = float(
+            cfg.get("approach", {}).get("surface_settle_max_tray_tilt_deg", 8.0)
+        )
+        surface_ok = bool(out_s.tray_ok) and float(settle_tilt_peak) <= max_tilt_ok
+        clean = {
+            k: v
+            for k, v in dict(surface_meta).items()
+            if not str(k).startswith("_")
+            and not hasattr(v, "dtype")
+            and not isinstance(v, PrivGraspGeom)
+        }
+        clean["stop_after_surface"] = True
+        clean["settle_tilt_peak_deg"] = float(settle_tilt_peak)
+        print(
+            f"pci: stop_after_surface — tray_ok={int(bool(out_s.tray_ok))} "
+            f"settle_tilt={settle_tilt_peak:.2f}deg "
+            f"ok={int(surface_ok)}",
+            flush=True,
+        )
+        return {
+            "success": bool(surface_ok),
+            "mouth_ok": False,
+            "insert_ok": False,
+            "tray_ok": bool(out_s.tray_ok),
+            "peg_ok": bool(out_s.peg_ok),
+            "fail_reason": "" if surface_ok else "surface_tilt_or_tray",
+            "align_phase": "SURFACE",
+            "align_steps": align_steps,
+            "control_steps": 0,
+            "final_phase": "SURFACE_DONE",
+            "final_tip_dist_m": feat_s.tip_socket_dist_m,
+            "eval_only": True,
+            "hybrid_summary": hybrid.episode_summary(),
+            "traj_tail": [],
+            "traj": [],
+            "phase_a_mode": "pbvs_biased_surface_press",
+            "approach_noise": clean,
+            "surface_meta": clean,
+            "surface_reason": "stop_after_surface",
+            "compliance": compliance_tag,
+            "priv_gate": True,
+        }
     pipeline.begin_compliant(
         task_frame,
         wrench[0],
