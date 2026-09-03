@@ -16,7 +16,13 @@ venv/
 # cloned reference repos (keep notes in docs/)
 refs/
 
-# editor
+# editor / agent local
 .idea/
 .vscode/
+.cursor/
 *.swp
+
+# local tip-search experiments (not scheme_l3 paper stack)
+configs/F_*.yaml
+configs/P1_*.yaml
+configs/P1_mouth_peg.yaml
