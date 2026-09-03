@@ -103,9 +103,21 @@ def main() -> int:
                 x["t"] = i / float(fps)
 
     t = np.asarray([float(x["t"]) for x in trace], dtype=np.float64)
-    rr = np.asarray([float(x["resid_r"]) for x in trace], dtype=np.float64)
-    rl = np.asarray([float(x["resid_l"]) for x in trace], dtype=np.float64)
-    fdes = np.asarray([float(x.get("f_des", 0.15)) for x in trace], dtype=np.float64)
+    rr = np.asarray(
+        [float(x["resid_r"]) if x.get("resid_r") is not None else float("nan") for x in trace],
+        dtype=np.float64,
+    )
+    rl = np.asarray(
+        [float(x["resid_l"]) if x.get("resid_l") is not None else float("nan") for x in trace],
+        dtype=np.float64,
+    )
+    fdes_list: list[float] = []
+    last_fdes = float("nan")
+    for x in trace:
+        if x.get("f_des") is not None:
+            last_fdes = float(x["f_des"])
+        fdes_list.append(last_fdes)
+    fdes = np.asarray(fdes_list, dtype=np.float64)
     phases = [str(x.get("phase", "")) for x in trace]
 
     fig, ax = plt.subplots(figsize=(10, 4.2), dpi=120)

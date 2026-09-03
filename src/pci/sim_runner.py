@@ -18,13 +18,88 @@ from reach_insert_rl.env.handoff_env import InsertHandoffEnv, load_manifest_entr
 
 from pci.approach_noise import ApproachNoiseConfig
 from pci.compliant.fingers import FingerCompliantConfig
-from pci.compliant.insert import CompliantInsertConfig
+from pci.compliant.insert import CompliantInsertConfig, CompliantInsertController
 from pci.compliant.left_tray_follow import LeftTrayFollowConfig, LeftTrayFollowController
 from pci.compliant.left_wrist_admit import LeftWristAdmitConfig, LeftWristAdmitController
 from pci.compliant.priv_grasp_opt import PrivGraspOptConfig, PrivGraspOptController
 from pci.compliant.search import CompliantSearchConfig, CompliantSearchController
 from pci.features import features_from_raw, pbvs_standoff_gate_ok
 from pci.priv_geom import PrivGraspGeom, copy_priv_grasp_geom, read_priv_grasp_geom
+from pci.conntact_repro import (
+    ConnTactSpiralParams,
+    height_drop_enter,
+    spiral_target_on_plane,
+)
+from pci.franka_spiral_repro import (
+    FrankaSpiralParams,
+    FrankaSpiralState,
+    height_drop_enter as franka_height_drop_enter,
+    spiral_target_on_plane as franka_spiral_target_on_plane,
+)
+from pci.psft_repro import (
+    PSFTParams,
+    PSFTState,
+    height_drop_enter as psft_height_drop_enter,
+    spiral_target_on_plane as psft_spiral_target_on_plane,
+)
+from pci.coupling_ekf import CouplingEKF
+from pci.tip_contact_estimator import ContactTipEstimator
+from pci.tip_theory_estimator import (
+    ExtrinsicTipAxisEKF,
+    ExtrinsicTipStateEKF,
+    TheoryEstConfig,
+    is_track_a_theory_mode,
+    is_track_a_tip_axis_mode,
+)
+from pci.fail_driven_hard_hqp import HardHqpConfig
+from pci.track_b_clep import ClepConfig, ClepState
+from pci.track_b_fasr import FasrConfig, FasrState
+from pci.track_a_tec_joint import (
+    TecJointConfig,
+    TecJointState,
+    is_tec_joint_mode,
+    select_tip_for_gmhqp,
+)
+from pci.track_b_gmhqp import (
+    GmhqpConfig,
+    GmhqpState,
+    is_gmhqp_mode,
+    is_gmhqp_tip_obs_mode,
+)
+from pci.track_b_gmhqp_ftip import GmhqpFtipConfig, GmhqpFtipState
+from pci.track_b_gmhqp_compc import GmhqpCompcConfig, GmhqpCompcState
+from pci.track_b_gmhqp_ac import GmhqpAcConfig, GmhqpAcState
+from pci.track_b_hybrid_gmhqp import HybridGmhqpConfig, HybridGmhqpState
+from pci.track_b_oigs import OigsConfig, OigsState
+from pci.track_b_phig import (
+    PhigConfig,
+    PhigState,
+    phig_axial_override,
+    phig_near_mouth,
+    phig_select_mode,
+)
+from pci.tip_tracking_baselines import (
+    PlanarCouplingEstimator,
+    SpiralForceHoleDetectState,
+    TipCouplingEstimator,
+    TipHybridState,
+    baseline_hold_r,
+    is_track_a_est_mode,
+    observe_tip_planar,
+    priv_oracle_mouth_target,
+    tip_hybrid_select,
+    tip_msar_blend_target,
+    tip_msar_slip_trip,
+    tip_oracle_slip_trip,
+    tip_pivot_upright,
+    tip_slip_can_enter_restore,
+    tip_star_local_target,
+    tip_star_slip_trip,
+    tip_star_track_saturate,
+    tip_star_yield_mouth,
+    deploy_mouth_yield_cue,
+    update_spiral_force_hole_detect,
+)
 from pci.pbvs_socket_bias import (
     SocketBiasConfig,
     bias_meta,
@@ -43,6 +118,7 @@ from pci.sensors import (
 )
 from pci.task_frame import TaskFrame
 from pci.ego_video import EgoVideoRecorder
+from pci.friction_ablation import apply_friction_ablation
 from pci.wrist import apply_dual_wrist_delta44, hole_task_basis, wrench_in_hole_frame
 
 
@@ -52,6 +128,215 @@ def _peg_in_right_wrist(geom: PrivGraspGeom) -> np.ndarray:
         geom.right_wrist_rot.T @ (geom.peg_pos - geom.right_wrist_pos),
         dtype=np.float64,
     ).reshape(3)
+
+
+
+def _plan_surface_enter_spiral(
+    tip0: np.ndarray,
+    socket_pos: np.ndarray,
+    hole_axis: np.ndarray,
+    plane_n: np.ndarray,
+    *,
+    pitch_m: float,
+    dtheta: float,
+    r_min_m: float,
+    n_max: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Privileged on-surface Archimedean spiral into the hole.
+
+    Waypoints lie on the contact plane (point tip0, normal plane_n), centered
+    at the hole-axis point projected onto that plane. Radius shrinks from the
+    start tip offset down to r_min so the path is guaranteed to reach the mouth.
+    Returns (waypoints[N,3], radii[N], thetas[N], center[3], (t1,t2,n)).
+    """
+    tip0 = np.asarray(tip0, dtype=np.float64).reshape(3)
+    n = np.asarray(plane_n, dtype=np.float64).reshape(3)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    t1, t2, n = hole_task_basis(n)
+    c_hole = _hole_axis_point_at_tip(tip0, socket_pos, hole_axis)
+    # Project hole center onto the contact plane through tip0.
+    center = c_hole - n * float(np.dot(c_hole - tip0, n))
+    off0 = tip0 - center
+    off0 = off0 - n * float(np.dot(off0, n))
+    r0 = float(np.linalg.norm(off0))
+    if r0 < 1e-9:
+        # Already at center: tiny circle then sink conceptually at mouth.
+        r0 = max(float(r_min_m), 0.001)
+        theta0 = 0.0
+    else:
+        theta0 = float(np.arctan2(float(off0 @ t2), float(off0 @ t1)))
+    pitch = max(float(pitch_m), 1e-6)
+    dth = max(float(dtheta), 1e-4)
+    r_min = max(float(r_min_m), 0.0005)
+    pts: list[np.ndarray] = []
+    rs: list[float] = []
+    ths: list[float] = []
+    theta = theta0
+    # Start at current tip radius (or slightly outside), spiral inward.
+    r = max(r0, r_min)
+    for _i in range(max(1, int(n_max))):
+        p = center + r * (np.cos(theta) * t1 + np.sin(theta) * t2)
+        pts.append(p)
+        rs.append(r)
+        ths.append(theta)
+        if r <= r_min + 1e-9:
+            break
+        theta = theta + dth
+        turn = (theta - theta0) / (2.0 * np.pi)
+        r = max(r_min, r0 - pitch * turn)
+    wps = np.stack(pts, axis=0)
+    return (
+        wps,
+        np.asarray(rs, dtype=np.float64),
+        np.asarray(ths, dtype=np.float64),
+        center,
+        np.stack([t1, t2, n], axis=0),
+    )
+
+
+def _priv_planned_hole_diag(
+    feat,
+    *,
+    along0_m: float,
+    mouth_lat_m: float,
+    enter_lat_m: float,
+    enter_along_min_m: float,
+) -> tuple[bool, bool, float]:
+    """Privileged mouth/enter flags for planned-spiral (diagnostic only)."""
+    lat = float(feat.lateral_m)
+    along = float(feat.along_m)
+    along_enter_m = max(0.0, float(along0_m) - along)
+    at_mouth = lat <= float(mouth_lat_m)
+    entered = lat <= float(enter_lat_m) and along_enter_m >= float(enter_along_min_m)
+    return at_mouth, entered, along_enter_m
+
+
+def _priv_tip_surface_depth_m(
+    tip: np.ndarray, anchor: np.ndarray, normal: np.ndarray
+) -> float:
+    """Signed tip depth from privileged contact plane (anchor, normal). + = lifted off."""
+    n = np.asarray(normal, dtype=np.float64).reshape(3)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    a = np.asarray(anchor, dtype=np.float64).reshape(3)
+    t = np.asarray(tip, dtype=np.float64).reshape(3)
+    return float(np.dot(t - a, n))
+
+
+def _priv_clamp_hold_on_surface(
+    hold_r: np.ndarray,
+    *,
+    anchor: np.ndarray,
+    normal: np.ndarray,
+    max_lift_m: float,
+) -> np.ndarray:
+    """Privileged: do not command wrist target above the contact plane."""
+    out = np.asarray(hold_r, dtype=np.float64).reshape(3).copy()
+    n = np.asarray(normal, dtype=np.float64).reshape(3)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    a = np.asarray(anchor, dtype=np.float64).reshape(3)
+    lift = float(np.dot(out - a, n))
+    if lift > float(max_lift_m):
+        out = out - n * (lift - float(max_lift_m))
+    return out
+
+
+def _priv_planned_surface_ax_step(
+    a_cfg: dict,
+    *,
+    contact_sp: float,
+    f_des_step: float,
+    depth_err: float,
+    planar_err_m: float,
+    kp: float,
+    max_step: float,
+) -> float:
+    """ConnTact-style axial seeking on the contact plane.
+
+    Reference (swri-robotics/ConnTact SpiralToFindHole):
+      - command a constant seeking wrench into the surface
+      - spiral pose keeps z = current (no position lift-off)
+      - hole enter = tip drops below surface
+
+    We approximate seeking with tiny position steps around f_des.
+    Never issue large negative ax (that was ep03 continuous lift-off).
+    If tip is still on/into the plane, overload only zeros press — no flyaway.
+    """
+    f_tol = float(a_cfg.get("surface_planned_force_ok_tol_n", 0.008))
+    lift_tol = float(a_cfg.get("surface_planned_surface_lift_tol_m", 0.0006))
+    reseat_m = float(a_cfg.get("surface_planned_surface_reseat_m", 0.00012))
+    seek_max = float(a_cfg.get("surface_planned_seek_step_m", 0.00012))
+    probe_m = float(a_cfg.get("surface_planned_probe_press_m", 0.00006))
+    # Cap unload per step (ConnTact does not position-retract off the tray).
+    unload_cap = float(
+        a_cfg.get("surface_planned_seek_unload_cap_m", seek_max)
+    )
+    unload_cap = max(1e-5, min(unload_cap, seek_max, max_step))
+    contact = float(contact_sp)
+    f_des = float(f_des_step)
+    on_surface = float(depth_err) <= float(lift_tol)
+
+    if float(depth_err) > lift_tol:
+        # Floated off plane — reseat (press), never keep unloading.
+        return max(
+            float(min(reseat_m, seek_max) * min(depth_err / max(lift_tol, 1e-6), 1.5)),
+            probe_m,
+        )
+
+    err_f = f_des - contact
+    if err_f > f_tol:
+        # Underforce: seek/probe into surface.
+        return float(
+            max(np.clip(kp * err_f, 0.0, min(seek_max, max_step)), probe_m)
+        )
+    if err_f < -f_tol:
+        # ConnTact: stay on surface — no large lift. But ep01 dug to 2–4N
+        # residual; allow a tiny unload when heavily overloaded.
+        if on_surface:
+            heavy_n = float(
+                a_cfg.get("surface_planned_heavy_resid_n", max(0.45, f_des * 8.0))
+            )
+            if contact >= heavy_n:
+                return -float(min(unload_cap, seek_max * 0.5))
+            return 0.0
+        return 0.0
+    # In band: tiny probe (hole-drop sense).
+    return float(min(max(probe_m * 0.5, 0.0), seek_max, max_step))
+
+
+def _priv_peg_tray_contact_force_n(raw) -> tuple[float, int]:
+    """Privileged: sum |F| of MuJoCo contacts between peg and tray/socket geoms."""
+    import mujoco
+
+    model = raw._model
+    data = raw._data
+    peg_body = int(model.body("industreal_round_peg_8mm").id)
+    tray_body = int(model.body("industreal_tray_insert_round_peg_8mm").id)
+    peg_geoms = {
+        g for g in range(model.ngeom) if int(model.geom_bodyid[g]) == peg_body
+    }
+    # tray subtree geoms
+    tray_bodies = {tray_body}
+    changed = True
+    while changed:
+        changed = False
+        for bid in range(model.nbody):
+            if int(model.body_parentid[bid]) in tray_bodies and bid not in tray_bodies:
+                tray_bodies.add(bid)
+                changed = True
+    tray_geoms = {
+        g for g in range(model.ngeom) if int(model.geom_bodyid[g]) in tray_bodies
+    }
+    total = 0.0
+    n = 0
+    force = __import__("numpy").zeros(6, dtype=__import__("numpy").float64)
+    for i in range(int(data.ncon)):
+        g1, g2 = int(data.contact[i].geom1), int(data.contact[i].geom2)
+        pair = {g1, g2}
+        if peg_geoms & pair and tray_geoms & pair:
+            mujoco.mj_contactForce(model, data, i, force)
+            total += float(__import__("numpy").linalg.norm(force[:3]))
+            n += 1
+    return float(total), int(n)
 
 
 def _hole_axis_point_at_tip(
@@ -200,34 +485,63 @@ def _tip_stick_fsm_delta(
     clear_contact_n: float,
     mouth_lat_m: float,
     lat_enter_m: float,
+    press_frames: int = 16,
 ) -> tuple[np.ndarray, float, str, bool]:
-    """Lift-off → tip-slide toward hole → soft retouch / re-lift.
+    """ConnTact-style surface seek: brief unload → force-on-surface slide to hole.
+
+    Default path keeps seeking force while moving XY toward the hole (like
+    ConnTact SpiralToFindHole seeking_force), instead of flying unloaded.
+    Optional hop_mode (short slide_frames) still does discrete lift/press cycles.
 
     Returns (d_tip, f_cmd, next_phase, use_live_offset).
     """
+    del press_frames  # reserved; press/retouch timing below
     lat, axis_err, toward = _tip_hole_pose_err(
         tip_pos, center, hole_axis, peg_axis
     )
-    clear_m = float(
-        np.clip(clear_lift_m + 0.006 * axis_err + 0.2 * lat, clear_lift_m, 0.008)
-    )
+    # Mild stiction break only — ConnTact stays in contact for search.
+    clear_m = float(np.clip(clear_lift_m, 0.0008, 0.003))
+    hop_mode = float(slide_step_m) <= 0.006 and int(slide_frames) <= 12
+    seek_f = max(0.05, float(f_des))
     if phase == "lift":
-        d = (-press_ax) * max(0.0012, clear_m / max(1, lift_frames))
+        d = (-press_ax) * max(0.0006, clear_m / max(1, lift_frames))
         f_cmd = 0.02
-        if contact_n <= clear_contact_n and phase_i >= max(6, lift_frames // 2):
+        # Don't demand full loss of contact; brief unload then slide on surface.
+        if phase_i >= max(4, lift_frames // 2) or contact_n <= max(
+            clear_contact_n, 0.25 * seek_f
+        ):
             return d, f_cmd, "slide", True
         if phase_i >= lift_frames:
             return d, f_cmd, "slide", True
         return d, f_cmd, "lift", True
     if phase == "slide":
+        if hop_mode:
+            hop = float(np.clip(slide_step_m, 0.002, 0.008))
+            step = hop / float(max(3, int(slide_frames)))
+            step = min(step, max(lat * 0.9, 0.0008))
+            tip_goal = tip_pos + toward * step * max(3, int(slide_frames))
+            tip_goal = tip_goal + (-press_ax) * 0.0004
+            d = tip_goal - tip_pos
+            dn = float(np.linalg.norm(d))
+            cap = max(hop, 0.004)
+            if dn > cap > 0.0:
+                d = d * (cap / dn)
+            f_cmd = 0.02
+            if phase_i + 1 >= max(3, int(slide_frames)):
+                return d, f_cmd, "press", False
+            return d, f_cmd, "slide", False
+        # Surface-compliant seek: planar toward hole + tiny press (ConnTact).
         tip_goal = np.asarray(center, dtype=np.float64).reshape(3).copy()
-        tip_goal = tip_goal + (-press_ax) * 0.0010
+        tip_goal = tip_goal + press_ax * 0.00015
         d = tip_goal - tip_pos
+        # Prefer planar motion; allow small axial press from force loop.
+        d_ax = float(np.dot(d, press_ax))
+        d = d - press_ax * d_ax
         dn = float(np.linalg.norm(d))
-        cap = max(float(slide_step_m), 0.008)
+        cap = max(float(slide_step_m), 0.006)
         if dn > cap > 0.0:
             d = d * (cap / dn)
-        f_cmd = 0.02
+        f_cmd = seek_f
         near = lat <= max(float(mouth_lat_m) * 1.25, 0.0055)
         improved = lat <= float(lat_enter_m) - 0.004
         if near:
@@ -237,6 +551,20 @@ def _tip_stick_fsm_delta(
                 return d, f_cmd, "lift" if (not improved) else "slide", False
             return d, f_cmd, "mouth", False
         return d, f_cmd, "slide", False
+    # press / retouch
+    if hop_mode and phase in ("press", "retouch"):
+        d = press_ax * 0.00035
+        if lat > float(mouth_lat_m):
+            d = d + toward * min(0.0005, 0.2 * lat)
+        f_cmd = float(f_des)
+        seated = contact_n >= max(0.35 * float(f_des), clear_contact_n * 3.0)
+        n_press = 14
+        if phase_i + 1 >= n_press or (seated and phase_i >= 6):
+            near = lat <= max(float(mouth_lat_m) * 1.25, 0.0055)
+            if near:
+                return d, f_cmd, "mouth", False
+            return d, f_cmd, "lift", False
+        return d, f_cmd, "press", False
     step = min(0.4 * float(slide_step_m), max(lat * 0.2, 0.001))
     d = toward * step + press_ax * 0.00012
     f_cmd = float(f_des)
@@ -245,6 +573,7 @@ def _tip_stick_fsm_delta(
             return d, f_cmd, "slide", False
         return d, f_cmd, "mouth", False
     return d, f_cmd, "retouch", False
+
 
 
 def _mouth_wiggle_delta(
@@ -315,7 +644,15 @@ def _priv_tip_spiral_gate(surface_meta: dict, cfg: dict) -> dict[str, Any]:
         x
         for x in tr
         if str(x.get("phase"))
-        in ("spiral", "lissajous", "priv_lat", "priv_lat_lissajous", "mouth_wiggle")
+        in (
+            "spiral",
+            "lissajous",
+            "priv_lat",
+            "priv_lat_lissajous",
+            "mouth_wiggle",
+            "planned_spiral",
+            "force_insert",
+        )
     ]
     if sp:
         mean_r = float(sum(float(x.get("resid_r", 0.0)) for x in sp) / len(sp))
@@ -506,6 +843,194 @@ def _insert_config(cfg: dict) -> CompliantInsertConfig:
     }
     names = {f.name for f in fields(CompliantInsertConfig)}
     return CompliantInsertConfig(**{k: v for k, v in merged.items() if k in names})
+
+
+def _run_planned_spiral_axial_insert(
+    env: InsertHandoffEnv,
+    gym_env,
+    *,
+    cfg: dict,
+    ctrl,
+    ego_recorder: EgoVideoRecorder | None,
+    force_trace: list,
+    t_force: int,
+    dt_f: float,
+    spiral_reason: str,
+    force_hole_entered: bool,
+    spiral_lat_min_m: float,
+) -> tuple[int, int, dict[str, Any]]:
+    """Phase-B axial admittance after planned_spiral (F/T only, fingers frozen)."""
+    a_cfg = cfg.get("approach", {})
+    if not bool(a_cfg.get("surface_spiral_force_insert", False)):
+        return 0, t_force, {}
+    require_hole = bool(a_cfg.get("surface_spiral_force_insert_require_hole", True))
+    deployable_only = bool(a_cfg.get("surface_spiral_force_insert_deployable_only", True))
+    min_lat = float(a_cfg.get("surface_spiral_force_insert_min_lat_m", 0.015))
+    allow_after = bool(a_cfg.get("surface_spiral_force_insert_after_spiral", False))
+    lat_ok = float(spiral_lat_min_m) <= min_lat
+    if deployable_only and not force_hole_entered:
+        return 0, t_force, {
+            "force_insert_skipped": True,
+            "force_insert_skip_reason": "deployable_requires_force_hole",
+        }
+    if require_hole and not force_hole_entered:
+        return 0, t_force, {
+            "force_insert_skipped": True,
+            "force_insert_skip_reason": "no_force_hole",
+        }
+    if (not force_hole_entered) and not (allow_after and lat_ok):
+        return 0, t_force, {
+            "force_insert_skipped": True,
+            "force_insert_skip_reason": "lat_or_hole_gate",
+            "force_insert_spiral_lat_min_mm": float(spiral_lat_min_m) * 1000.0,
+        }
+
+    raw = env.unwrapped
+    insert_ctrl = CompliantInsertController(_insert_config(cfg))
+    hold = current_action44(raw)
+    if getattr(ctrl, "_hold_l_hand", None) is not None:
+        hold = hold.copy()
+        hold[28:44] = np.asarray(ctrl._hold_l_hand, dtype=np.float64).reshape(16)
+    if getattr(ctrl, "_hold_l_arm", None) is not None:
+        arm_h = np.asarray(ctrl._hold_l_arm, dtype=np.float64).reshape(22)
+        hold[22:28] = arm_h[0:6].copy()
+        hold[28:44] = arm_h[6:22].copy()
+
+    feat0 = features_from_raw(raw)
+    wr0 = read_wrist_wrench_world(raw)
+    use_wrist_frame = bool(a_cfg.get("surface_spiral_force_insert_wrist_frame", True))
+    if use_wrist_frame:
+        pos0, rot0 = _right_wrist_site_pose(raw)
+        task_frame = TaskFrame.from_wrist_site(hold[0:3], rot0)
+    else:
+        task_frame = TaskFrame.from_hole_axis(
+            hold[0:3],
+            feat0.hole_axis,
+            peg_axis_world=feat0.peg_axis,
+        )
+    insert_ctrl.reset(task_frame, wr0[0], hold[0:3])
+
+    max_steps = int(
+        a_cfg.get(
+            "surface_spiral_force_insert_steps",
+            cfg.get("compliant", {}).get("insert", {}).get("max_insert_steps", 800),
+        )
+    )
+    peg_grace = int(a_cfg.get("surface_spiral_force_insert_peg_grace_frames", 24))
+    dt = _sim_dt(cfg)
+    insert_steps = 0
+    insert_reason = "run"
+    insert_ok = False
+    prev_delta: np.ndarray | None = None
+    peg_lost_streak = 0
+    tray_lost_streak = 0
+    pure_axial = bool(a_cfg.get("surface_spiral_force_insert_pure_axial", True))
+    max_ax_step = float(a_cfg.get("surface_spiral_force_insert_max_ax_step_m", 0.00035))
+    print(
+        f"pci: force-insert start reason={spiral_reason} "
+        f"hole={int(force_hole_entered)} lat_min={spiral_lat_min_m*1e3:.1f}mm "
+        f"max={max_steps}",
+        flush=True,
+    )
+    for _ in range(max_steps):
+        feat = features_from_raw(raw)
+        out = env._labeler.compute(raw)
+        wr = read_wrist_wrench_world(raw)
+        hold_r = hold[0:3].copy()
+        if use_wrist_frame:
+            _pos_i, rot_i = _right_wrist_site_pose(raw)
+            task_frame = TaskFrame.from_wrist_site(hold_r, rot_i)
+        else:
+            task_frame = TaskFrame.from_hole_axis(
+                hold_r, feat.hole_axis, peg_axis_world=feat.peg_axis
+            )
+        pr = insert_ctrl.step(
+            task_frame,
+            wr[0],
+            hold_r,
+            release_trigger=False,
+            dt=dt,
+            prev_delta_xyz=prev_delta,
+        )
+        prev_delta = np.asarray(pr.delta_xyz, dtype=np.float64).reshape(3)
+        hold = hold.copy()
+        if pure_axial:
+            approach = task_frame.approach_axis
+            ax_step = max(float(np.dot(prev_delta, approach)), 0.0)
+            ax_step = min(ax_step, max_ax_step)
+            hold[0:3] = hold[0:3] + approach * ax_step
+        else:
+            hold[0:3] = hold[0:3] + prev_delta
+        if pr.delta_left_xyz is not None:
+            d_left = np.asarray(pr.delta_left_xyz, dtype=np.float64).reshape(3)
+            hold[22:25] = hold[22:25] + d_left
+        if getattr(ctrl, "_hold_l_hand", None) is not None:
+            hold[28:44] = np.asarray(ctrl._hold_l_hand, dtype=np.float64).reshape(16)
+        step_action44(gym_env, hold, ego_recorder=ego_recorder)
+        insert_steps += 1
+        wh = task_frame.wrench_tool(wr[0])
+        wh_l = task_frame.wrench_tool(wr[1])
+        f_des_ins = float(
+            a_cfg.get(
+                "surface_planned_insert_f_des_n",
+                a_cfg.get("surface_const_force_des_n", 0.05),
+            )
+        )
+        force_trace.append(
+            {
+                "t": float(t_force) * dt_f,
+                "step": float(t_force),
+                "phase": "force_insert",
+                "resid_r": float(np.linalg.norm(wr[0][:3])),
+                "resid_l": float(np.linalg.norm(wr[1][:3])),
+                "fz_r": float(wh[2]),
+                "fz_l": float(wh_l[2]),
+                "f_des": float(f_des_ins),
+                "lat_mm": float(feat.lateral_m) * 1000.0,
+                "along_mm": float(feat.along_m) * 1000.0,
+                "insert_reason": str(pr.reason),
+                "force_hole_entered": int(force_hole_entered),
+                "peg_ok": int(out.peg_ok),
+                "tray_ok": int(out.tray_ok),
+                "peg_contact_n": int(out.peg_contact_count),
+            }
+        )
+        t_force += 1
+        insert_ok = bool(out.insert_ok)
+        if insert_ok:
+            insert_reason = "insert_ok"
+            break
+        if pr.done:
+            insert_reason = str(pr.reason)
+            break
+        if out.peg_ok:
+            peg_lost_streak = 0
+        else:
+            peg_lost_streak += 1
+        if out.tray_ok:
+            tray_lost_streak = 0
+        else:
+            tray_lost_streak += 1
+        if peg_lost_streak >= peg_grace and not out.peg_ok:
+            insert_reason = "peg_contact_lost"
+            break
+        if tray_lost_streak >= peg_grace and not out.tray_ok:
+            insert_reason = "tray_contact_lost"
+            break
+
+    print(
+        f"pci: force-insert done steps={insert_steps} reason={insert_reason} "
+        f"insert_ok={int(insert_ok)} along={feat.along_m*1e3:.1f}mm "
+        f"lat={feat.lateral_m*1e3:.1f}mm",
+        flush=True,
+    )
+    return insert_steps, t_force, {
+        "force_insert_steps": int(insert_steps),
+        "force_insert_reason": str(insert_reason),
+        "force_insert_ok": bool(insert_ok),
+        "insert_ok": bool(insert_ok),
+        "force_hole_entered": bool(force_hole_entered),
+    }
 
 
 def _finger_config(cfg: dict) -> FingerCompliantConfig:
@@ -756,11 +1281,15 @@ def run_pbvs_biased_surface_press(
     raw = env.unwrapped
     a_cfg = cfg.get("approach", {})
     bias_cfg = _socket_bias_cfg(cfg)
+    # Optional privileged_diagnostic: scale peg/tray geom friction at episode start.
+    friction_meta = apply_friction_ablation(raw, cfg)
     feat0 = features_from_raw(raw)
     gen = rng if rng is not None else np.random.default_rng(bias_cfg.seed)
     socket_off = sample_socket_bias_world(feat0.hole_axis, cfg=bias_cfg, rng=gen)
     tilt_rot, tilt_ang = sample_hole_axis_tilt(feat0.hole_axis, cfg=bias_cfg, rng=gen)
     meta: dict[str, Any] = bias_meta(socket_off, axis_tilt_rad=tilt_ang)
+    if friction_meta.get("enabled"):
+        meta["friction_ablation"] = friction_meta
 
     if hybrid.controller is None:
         return 0, "no_controller", meta
@@ -806,6 +1335,9 @@ def run_pbvs_biased_surface_press(
     left_hand0 = None
     freeze_left_hand = bool(a_cfg.get("surface_freeze_left_hand", True))
     phase_a_left_qp_fingers = bool(a_cfg.get("surface_phase_a_left_qp_fingers", False))
+    # Tip→hole search pose-hold: priv_grasp QP on fingers while wrist tip-servos.
+    # Default off — P1 baseline keeps locked hold_*_hand during tip search.
+    tip_search_pose_hold = bool(a_cfg.get("surface_tip_search_pose_hold", False))
     if getattr(ctrl, "_hold_l_hand", None) is not None:
         left_hand0 = np.asarray(ctrl._hold_l_hand, dtype=np.float64).reshape(16).copy()
         s0 = float(a_cfg.get("surface_left_grasp_scale_init", 1.15))
@@ -990,14 +1522,36 @@ def run_pbvs_biased_surface_press(
         print(f"pci: ALIGN left_admit armed scale={align_admit_scale:.2f}", flush=True)
     reason = "align_timeout"
 
-    def _tighten_left_grasp(scale: float) -> None:
+    def _tighten_left_grasp(
+        scale: float, *, bypass_freeze: bool = False
+    ) -> dict[str, float | bool]:
+        """Raise left hand hold toward scale·q0.
+
+        Handoff normally freezes fingers (`surface_freeze_left_hand`). Tip-STAR /
+        Type-B slip restore may pass bypass_freeze=True so tighten is real.
+        Returns meta for audit: whether cmd/scale actually changed.
+        """
         nonlocal grasp_ramp_scale
+        out: dict[str, float | bool] = {
+            "ok": False,
+            "bypassed_freeze": bool(bypass_freeze and freeze_left_hand),
+            "scale": float(scale),
+            "mean_abs_before": 0.0,
+            "mean_abs_after": 0.0,
+        }
         if left_hand0 is None:
-            return
-        if freeze_left_hand:
+            return out
+        before = (
+            float(np.mean(np.abs(ctrl._hold_l_hand)))
+            if getattr(ctrl, "_hold_l_hand", None) is not None
+            else 0.0
+        )
+        out["mean_abs_before"] = before
+        if freeze_left_hand and not bypass_freeze:
             # Handoff lock: ignore squeeze/ramp requests.
             grasp_ramp_scale = 1.0
-            return
+            out["mean_abs_after"] = before
+            return out
         h = np.maximum(left_hand0, left_hand0 * float(scale))
         ctrl._hold_l_hand = np.clip(h, -1.5, 1.5)  # noqa: SLF001
         grasp_ramp_scale = float(scale)
@@ -1005,11 +1559,17 @@ def run_pbvs_biased_surface_press(
             arm = np.asarray(ctrl._hold_l_arm, dtype=np.float64).reshape(22).copy()
             arm[6:22] = ctrl._hold_l_hand
             ctrl._hold_l_arm = arm  # noqa: SLF001
+        after = float(np.mean(np.abs(ctrl._hold_l_hand)))
+        out["mean_abs_after"] = after
+        # Real change only — scale>1 alone is not enough (re-trip may be no-op).
+        out["ok"] = bool(after > before + 1e-6)
         print(
             f"pci: left grasp tighten scale={scale:.2f} "
-            f"mean|q|={np.mean(np.abs(ctrl._hold_l_hand)):.3f}",
+            f"mean|q|={before:.3f}->{after:.3f}"
+            f"{' (star bypass freeze)' if bypass_freeze and freeze_left_hand else ''}",
             flush=True,
         )
+        return out
 
     def _maybe_ramp_left_grasp_for_tilt(*, tag: str) -> None:
         """Tilt/rel_rot-gated left grasp ramp (privileged_diagnostic)."""
@@ -2522,8 +3082,17 @@ def run_pbvs_biased_surface_press(
                         # Wrist mocap spiral alone does not move tip (finger stretch);
                         # servo wrist so TIP tracks the spiral (privileged_diagnostic).
                         _update_grasp_slip()
-                        if grasp_slip_peak > grasp_slip_lim or meta.get(
-                            "grasp_abort_phase"
+                        # Non-rigid grasp is expected: planar_C tip tracking exists for
+                        # this. Never skip the whole spiral because peel stretch tripped
+                        # the slip meter (ep07 never searched).
+                        if (
+                            grasp_slip_peak > grasp_slip_lim or meta.get("grasp_abort_phase")
+                        ) and not (
+                            bool(a_cfg.get("surface_planned_force_hole_detect", False))
+                            and str(a_cfg.get("surface_tip_search_mode", ""))
+                            .strip()
+                            .lower()
+                            in ("planned_spiral", "planned", "priv_spiral")
                         ):
                             feat_s = features_from_raw(raw)
                             out_s = env._labeler.compute(raw)
@@ -2551,6 +3120,13 @@ def run_pbvs_biased_surface_press(
                             for rs in gate.get("reasons", []):
                                 print(f"pci: GATE fail — {rs}", flush=True)
                             return steps, "priv_tip_spiral_gate_fail", meta
+                        if grasp_slip_peak > grasp_slip_lim:
+                            print(
+                                f"pci: continue spiral despite pre-slip="
+                                f"{grasp_slip_peak*1e3:.1f}mm (tip-track mode)",
+                                flush=True,
+                            )
+                            meta.pop("grasp_abort_phase", None)
                         # Re-latch grasp baseline AFTER successful lift so spiral
                         # grasp_slip measures "drop during spiral", not peel stretch.
                         geom_sp0 = read_priv_grasp_geom(raw)
@@ -2572,9 +3148,178 @@ def run_pbvs_biased_surface_press(
                             hold_l_hand = np.asarray(
                                 ctrl._hold_l_hand, dtype=np.float64
                             ).reshape(16)
+                        # OIGS / GMHQP residuals; wrist laws read later.
+                        tip_oigs_enable = bool(
+                            a_cfg.get("surface_tip_oigs_enable", False)
+                        ) or str(
+                            a_cfg.get("surface_tip_baseline", "")
+                        ).strip().lower() in (
+                            "track_b_oigs",
+                            "oigs",
+                            "object_impedance_grasp_stiff",
+                            "pfanne_grasp_stiff",
+                        )
+                        tip_gmhqp_enable = bool(
+                            a_cfg.get("surface_tip_gmhqp_enable", False)
+                        ) or str(
+                            a_cfg.get("surface_tip_baseline", "")
+                        ).strip().lower() in (
+                            "track_b_gmhqp",
+                            "gmhqp",
+                            "grasp_map_hqp",
+                            "grasp_map_operational_hqp",
+                            "object_task_hqp",
+                            "track_a_gmhqp_tip_obs",
+                            "gmhqp_tip_obs",
+                            "track_a_gmhqp",
+                            "track_a_gmhqp_tip_fuse",
+                            "gmhqp_tip_fuse",
+                        )
+                        tip_hybrid_gmhqp_enable = bool(
+                            a_cfg.get("surface_tip_hybrid_gmhqp_enable", False)
+                        ) or str(
+                            a_cfg.get("surface_tip_baseline", "")
+                        ).strip().lower() in (
+                            "track_b_hybrid_gmhqp",
+                            "hybrid_gmhqp",
+                            "gmhqp_hybrid",
+                            "tip_planar_c_hybrid_hqp",
+                            "escande_hybrid_gmhqp",
+                        )
+                        oigs_state = OigsState()
+                        oigs_cfg = OigsConfig()  # overwritten after baseline mode parse
+                        gmhqp_state = GmhqpState()
+                        gmhqp_cfg = GmhqpConfig()  # overwritten after baseline mode parse
+                        hybrid_gmhqp_state = HybridGmhqpState()
+                        hybrid_gmhqp_cfg = HybridGmhqpConfig()
+
+                        # Arm peg-in-hand QP latch at tip-search start (not Phase-A latch).
+                        if tip_search_pose_hold and use_priv_grasp_a:
+                            if phase_a_qp is None:
+                                phase_a_qp = PrivGraspOptController(
+                                    _priv_grasp_config(cfg)
+                                )
+                            phase_a_qp.reset(
+                                copy_priv_grasp_geom(geom_sp0),
+                                hold_r_hand,
+                                hold_l_hand,
+                            )
+                            phase_a_qp_ready = True
+                            meta["tip_search_pose_hold"] = True
+                            print(
+                                "pci: tip-search pose-hold QP armed "
+                                "(peg-in-hand / tip-wrist)",
+                                flush=True,
+                            )
+
+                        def _fill_tip_search_hands(cmd44: np.ndarray) -> None:
+                            """Locked fingers, or pose-hold QP Δq if enabled."""
+                            nonlocal phase_a_rel_peak
+                            cmd44[6:22] = hold_r_hand
+                            cmd44[28:44] = hold_l_hand
+                            if not tip_search_pose_hold:
+                                return
+                            if not (
+                                use_priv_grasp_a
+                                and phase_a_qp is not None
+                                and phase_a_qp_ready
+                                and force_labeler is not None
+                            ):
+                                return
+                            geom_ph = read_priv_grasp_geom(raw)
+                            f12_ph, lf12_ph = read_dual_finger_force24(
+                                raw, force_labeler
+                            )
+                            po_ph = phase_a_qp.step(geom_ph, f12_ph, lf12_ph)
+                            phase_a_rel_peak = max(
+                                phase_a_rel_peak, float(po_ph.rel_rot_err_rad)
+                            )
+                            # OIGS: feed Pfanne object residual into wrist path alpha.
+                            if tip_oigs_enable:
+                                oigs_state.obj_rot_err_rad = max(
+                                    float(po_ph.peg_inhand_rot_err_rad),
+                                    float(po_ph.rel_rot_err_rad),
+                                )
+                                # Pos residual not returned by result; use 0 (rot-gated).
+                                oigs_state.obj_pos_err_m = 0.0
+                            cmd44[6:22] = np.clip(
+                                hold_r_hand + po_ph.delta_right_hand16, -1.5, 1.5
+                            )
+                            if phase_a_left_qp_fingers:
+                                cmd44[28:44] = np.clip(
+                                    np.maximum(
+                                        hold_l_hand + po_ph.delta_left_hand16,
+                                        hold_l_hand * 0.98,
+                                    ),
+                                    -1.5,
+                                    1.5,
+                                )
+
                         feat_sp0 = features_from_raw(raw)
                         tip_sp0 = np.asarray(feat_sp0.tip_pos, dtype=np.float64).reshape(3)
-                        t1, t2, _ax_h = hole_task_basis(feat_sp0.hole_axis)
+                        # Spiral rotation axis = contact normal (peg↔hole surface),
+                        # NOT peg shaft center. Flush face contact is the only case
+                        # where peg/hole axis ≈ contact normal.
+                        hole_u_sp = feat_sp0.hole_axis / (
+                            np.linalg.norm(feat_sp0.hole_axis) + 1e-12
+                        )
+                        peg_u_sp = feat_sp0.peg_axis / (
+                            np.linalg.norm(feat_sp0.peg_axis) + 1e-12
+                        )
+                        wr_sp0 = read_wrist_wrench_world(raw)
+                        f_r_sp0 = np.asarray(wr_sp0[0][:3], dtype=np.float64).reshape(3)
+                        f_n_sp0 = float(np.linalg.norm(f_r_sp0))
+                        axis_mode = str(
+                            a_cfg.get("surface_tip_spiral_axis", "contact_normal")
+                        ).strip().lower()
+                        if axis_mode in ("peg", "peg_axis"):
+                            spiral_n = peg_u_sp.copy()
+                            spiral_axis_src = "peg"
+                        elif axis_mode in ("hole", "hole_axis"):
+                            spiral_n = hole_u_sp.copy()
+                            spiral_axis_src = "hole"
+                        else:
+                            # Force on wrist ≈ surface→peg push; align to hole opening.
+                            if f_n_sp0 >= float(
+                                a_cfg.get("surface_tip_spiral_contact_fmin_n", 0.03)
+                            ):
+                                spiral_n = f_r_sp0 / (f_n_sp0 + 1e-12)
+                                if float(spiral_n @ hole_u_sp) < 0.0:
+                                    spiral_n = -spiral_n
+                                spiral_axis_src = "force"
+                            else:
+                                # Flat mouth fallback: socket face normal ≈ hole axis.
+                                spiral_n = hole_u_sp.copy()
+                                spiral_axis_src = "hole_fallback"
+                        t1, t2, spiral_n = hole_task_basis(spiral_n)
+                        # Press into the contact plane (ConnTact seeking along -normal).
+                        press_ax_spiral = -spiral_n
+                        ang_peg_n = float(
+                            np.degrees(
+                                np.arccos(
+                                    float(
+                                        np.clip(abs(float(peg_u_sp @ spiral_n)), 0.0, 1.0)
+                                    )
+                                )
+                            )
+                        )
+                        ang_hole_n = float(
+                            np.degrees(
+                                np.arccos(
+                                    float(
+                                        np.clip(abs(float(hole_u_sp @ spiral_n)), 0.0, 1.0)
+                                    )
+                                )
+                            )
+                        )
+                        print(
+                            f"pci: spiral-axis src={spiral_axis_src} "
+                            f"|F|={f_n_sp0:.3f}N "
+                            f"ang(peg,n)={ang_peg_n:.1f}deg "
+                            f"ang(hole,n)={ang_hole_n:.1f}deg "
+                            f"axis_err={float(np.degrees(feat_sp0.axis_error_rad)):.1f}deg",
+                            flush=True,
+                        )
                         spiral_center_mode = str(
                             a_cfg.get("surface_tip_spiral_center", "tip")
                         ).strip().lower()
@@ -2593,16 +3338,761 @@ def run_pbvs_biased_surface_press(
                             a_cfg.get("surface_tip_spiral_freeze_offset", True)
                         )
                         offset_wt0_sp = site_sp[0:3].copy() - tip_sp0
+                        tip_baseline_mode = str(
+                            a_cfg.get("surface_tip_baseline", "")
+                        ).strip().lower()
+                        if not tip_baseline_mode and bool(
+                            a_cfg.get("surface_planned_spiral_wrist_ff", False)
+                        ):
+                            tip_baseline_mode = "tip_servo_ff"
+                        # Track-A: observer → GMHQP tip task (not Oracle PD).
+                        # TEC joint: same path; tip_ctrl gated by NIS/contact theory.
+                        tip_tec_joint = bool(
+                            is_tec_joint_mode(tip_baseline_mode)
+                        ) or bool(a_cfg.get("surface_tip_tec_joint_enable", False))
+                        tip_gmhqp_tip_obs = bool(
+                            is_gmhqp_tip_obs_mode(tip_baseline_mode)
+                        ) or tip_tec_joint or (
+                            bool(a_cfg.get("surface_tip_gmhqp_use_tip_obs", False))
+                            and (
+                                tip_gmhqp_enable
+                                or is_gmhqp_mode(tip_baseline_mode)
+                            )
+                        )
+                        tec_joint_cfg = TecJointConfig(
+                            nis_chi2_accept=float(
+                                a_cfg.get(
+                                    "surface_tip_tec_nis_chi2",
+                                    TecJointConfig.nis_chi2_accept,
+                                )
+                                or TecJointConfig.nis_chi2_accept
+                            ),
+                            require_contact=bool(
+                                a_cfg.get("surface_tip_tec_require_contact", True)
+                            ),
+                            reject_on_slip=bool(
+                                a_cfg.get("surface_tip_tec_reject_on_slip", True)
+                            ),
+                            geom_disagree_sigma=float(
+                                a_cfg.get("surface_tip_tec_geom_sigma", 3.0) or 3.0
+                            ),
+                            uncert_sigma=float(
+                                a_cfg.get("surface_tip_tec_uncert_sigma", 3.0) or 3.0
+                            ),
+                        )
+                        tec_joint_state = TecJointState()
+                        tip_oracle_enable = tip_baseline_mode in (
+                            "priv_oracle_tip_servo",
+                            "oracle_tip",
+                            "oracle",
+                            "priv_oracle_tip_obs",
+                            "track_a_est_oracle",
+                            "est_oracle_tip_servo",
+                            "est_oracle",
+                            "track_a_theory_est",
+                            "track_a_theory_ekf",
+                            "theory_est_oracle",
+                            "tec_slim_oracle",
+                            "track_a_tip_axis",
+                            "track_a_tip_axis_ekf",
+                            "tip_axis_oracle",
+                            "tec_tip_axis_oracle",
+                        ) or bool(a_cfg.get("surface_tip_oracle_mouth", False))
+                        # Hybrid must not steal Oracle mouth PD.
+                        if tip_gmhqp_tip_obs:
+                            tip_oracle_enable = False
+                        tip_obs_sigma_mm = float(
+                            a_cfg.get("surface_tip_obs_noise_mm", 0.0) or 0.0
+                        )
+                        tip_obs_lag_frames = int(
+                            a_cfg.get("surface_tip_obs_lag_frames", 0) or 0
+                        )
+                        # Track-A: tip_hat (NOT tip_gt+noise). Theory / tip+axis EKF or v0.
+                        _tip_est_backend = str(
+                            a_cfg.get("surface_tip_est_backend", "") or ""
+                        ).strip().lower()
+                        if tip_gmhqp_tip_obs and not _tip_est_backend:
+                            _tip_est_backend = "theory_ekf"
+                        tip_axis_enable = (
+                            (not tip_gmhqp_tip_obs)
+                            and (
+                                is_track_a_tip_axis_mode(tip_baseline_mode)
+                                or (
+                                    bool(a_cfg.get("surface_tip_est_enable", False))
+                                    and _tip_est_backend
+                                    in (
+                                        "tip_axis_ekf",
+                                        "tip_axis",
+                                        "tec_tip_axis",
+                                        "extrinsic_tip_axis",
+                                    )
+                                )
+                            )
+                        )
+                        tip_theory_enable = (
+                            tip_gmhqp_tip_obs
+                            or is_track_a_theory_mode(tip_baseline_mode)
+                            or (
+                                bool(a_cfg.get("surface_tip_est_enable", False))
+                                and _tip_est_backend
+                                in (
+                                    "theory_ekf",
+                                    "tec_slim",
+                                    "extrinsic_ekf",
+                                    "theory",
+                                    "tip_axis_ekf",
+                                    "tip_axis",
+                                    "tec_tip_axis",
+                                    "extrinsic_tip_axis",
+                                )
+                            )
+                        )
+                        tip_est_enable = (
+                            bool(a_cfg.get("surface_tip_est_enable", False))
+                            or is_track_a_est_mode(tip_baseline_mode)
+                            or tip_gmhqp_tip_obs
+                        )
+                        tip_obs_enable = (
+                            (not tip_est_enable)
+                            and (
+                                tip_obs_sigma_mm > 0.0
+                                or tip_baseline_mode in ("priv_oracle_tip_obs",)
+                            )
+                        )
+                        tip_est: ContactTipEstimator | None = None
+                        tip_theory_ekf: ExtrinsicTipStateEKF | ExtrinsicTipAxisEKF | None = (
+                            None
+                        )
+                        tip_contact_sensor: ContactTipEstimator | None = None
+                        tip_est_err_peak_m = 0.0
+                        tip_est_err_sum_m = 0.0
+                        tip_est_err_n = 0
+                        tip_est_last_source = ""
+                        tip_est_seated_frames = 0
+                        tip_est_uncert_peak_m = 0.0
+                        tip_axis_err_peak_rad = 0.0
+                        tip_axis_hat: np.ndarray | None = None
+                        tip_est_wrist_prev = (
+                            np.asarray(site_sp[0:3], dtype=np.float64).reshape(3).copy()
+                            if tip_est_enable
+                            else None
+                        )
+                        if tip_theory_enable:
+                            # TEC-slim tip or tip+axis EKF.
+                            # Hybrid tip_obs→GMHQP: keep Escande law (no Oracle mouth PD).
+                            if tip_gmhqp_tip_obs:
+                                tip_oracle_enable = False
+                                tip_gmhqp_enable = True
+                                if not is_gmhqp_mode(tip_baseline_mode):
+                                    if tip_tec_joint:
+                                        tip_baseline_mode = "track_a_tec_joint_gmhqp"
+                                    else:
+                                        tip_baseline_mode = (
+                                            "track_a_gmhqp_tip_fuse"
+                                            if bool(
+                                                a_cfg.get(
+                                                    "surface_tip_theory_geom_prior",
+                                                    False,
+                                                )
+                                            )
+                                            else "track_a_gmhqp_tip_obs"
+                                        )
+                                tip_axis_enable = False
+                            else:
+                                tip_oracle_enable = True
+                                if tip_axis_enable:
+                                    if not is_track_a_tip_axis_mode(tip_baseline_mode):
+                                        tip_baseline_mode = "track_a_tip_axis"
+                                elif not is_track_a_theory_mode(tip_baseline_mode):
+                                    tip_baseline_mode = "track_a_theory_est"
+                            tip_contact_sensor = ContactTipEstimator(
+                                raw,
+                                ema=float(
+                                    a_cfg.get("surface_tip_est_ema", 0.55) or 0.55
+                                ),
+                                min_force_n=float(
+                                    a_cfg.get("surface_tip_est_min_force_n", 0.008)
+                                    or 0.008
+                                ),
+                                seat_force_n=float(
+                                    a_cfg.get("surface_tip_est_seat_force_n", 0.015)
+                                    or 0.015
+                                ),
+                                cluster_radius_m=float(
+                                    a_cfg.get(
+                                        "surface_tip_est_cluster_radius_m", 0.008
+                                    )
+                                    or 0.008
+                                ),
+                                force_pow=float(
+                                    a_cfg.get("surface_tip_est_force_pow", 1.5) or 1.5
+                                ),
+                                use_pca_locus=False,
+                            )
+                            _th_cfg = TheoryEstConfig(
+                                process_tip=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_process_tip", 2.0e-6
+                                    )
+                                    or 2.0e-6
+                                ),
+                                process_c=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_process_c", 2.0e-5
+                                    )
+                                    or 2.0e-5
+                                ),
+                                process_axis=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_process_axis", 5.0e-5
+                                    )
+                                    or 5.0e-5
+                                ),
+                                meas_contact_var=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_meas_contact_var",
+                                        2.0e-7,
+                                    )
+                                    or 2.0e-7
+                                ),
+                                meas_wrench_var=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_meas_wrench_var",
+                                        4.0e-5,
+                                    )
+                                    or 4.0e-5
+                                ),
+                                meas_axis_finger_var=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_meas_axis_finger_var",
+                                        8.0e-3,
+                                    )
+                                    or 8.0e-3
+                                ),
+                                meas_axis_wrist_var=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_meas_axis_wrist_var",
+                                        4.0e-2,
+                                    )
+                                    or 4.0e-2
+                                ),
+                                meas_axis_contact_var=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_meas_axis_contact_var",
+                                        1.0e-2,
+                                    )
+                                    or 1.0e-2
+                                ),
+                                meas_geom_tip_var=float(
+                                    a_cfg.get(
+                                        "surface_tip_theory_meas_geom_tip_var",
+                                        1.5e-5,
+                                    )
+                                    or 1.5e-5
+                                ),
+                                geom_tip_prior=bool(
+                                    a_cfg.get(
+                                        "surface_tip_theory_geom_prior", False
+                                    )
+                                )
+                                or bool(tip_tec_joint),
+                            )
+                            tip_theory_ekf = (
+                                ExtrinsicTipAxisEKF(_th_cfg)
+                                if tip_axis_enable
+                                else ExtrinsicTipStateEKF(_th_cfg)
+                            )
+                            _w0 = (
+                                np.asarray(site_sp[0:3], dtype=np.float64)
+                                .reshape(3)
+                                .copy()
+                            )
+                            _cen0, _f0, _n0 = tip_contact_sensor.measure_peg_tray_tip(
+                                raw, spiral_n
+                            )
+                            if tip_axis_enable:
+                                assert isinstance(tip_theory_ekf, ExtrinsicTipAxisEKF)
+                                _wa0 = _wrist_approach_axis(raw)
+                                tip_theory_ekf.reset(
+                                    wrist_pos=_w0,
+                                    plane_n=spiral_n,
+                                    tip_seed=_cen0 if (_cen0 is not None and _n0 > 0) else None,
+                                    axis_seed=_wa0,
+                                    wrist_rot=_right_wrist_site_pose(raw)[1],
+                                )
+                                tip_axis_hat = tip_theory_ekf.axis_world(spiral_n)
+                            else:
+                                tip_theory_ekf.reset(
+                                    wrist_pos=_w0,
+                                    plane_n=spiral_n,
+                                    tip_seed=_cen0 if (_cen0 is not None and _n0 > 0) else None,
+                                )
+                            tip_est_wrist_prev = _w0
+                        elif tip_est_enable:
+                            tip_oracle_enable = True
+                            tip_baseline_mode = "track_a_est_oracle"
+                            tip_est = ContactTipEstimator(
+                                raw,
+                                ema=float(
+                                    a_cfg.get("surface_tip_est_ema", 0.55) or 0.55
+                                ),
+                                min_force_n=float(
+                                    a_cfg.get("surface_tip_est_min_force_n", 0.008)
+                                    or 0.008
+                                ),
+                                seat_force_n=float(
+                                    a_cfg.get("surface_tip_est_seat_force_n", 0.015)
+                                    or 0.015
+                                ),
+                                outlier_gate_m=float(
+                                    a_cfg.get("surface_tip_est_outlier_gate_m", 0.012)
+                                    or 0.012
+                                ),
+                                holdover_frames=int(
+                                    a_cfg.get("surface_tip_est_holdover_frames", 12)
+                                    or 12
+                                ),
+                                cluster_radius_m=float(
+                                    a_cfg.get(
+                                        "surface_tip_est_cluster_radius_m", 0.008
+                                    )
+                                    or 0.008
+                                ),
+                                force_pow=float(
+                                    a_cfg.get("surface_tip_est_force_pow", 1.5) or 1.5
+                                ),
+                                use_pca_locus=bool(
+                                    a_cfg.get("surface_tip_est_use_pca", False)
+                                ),
+                                pca_min_contacts=int(
+                                    a_cfg.get("surface_tip_est_pca_min_n", 3) or 3
+                                ),
+                                holdover_mode=str(
+                                    a_cfg.get(
+                                        "surface_tip_est_holdover_mode",
+                                        "freeze_planar",
+                                    )
+                                    or "freeze_planar"
+                                ),
+                                holdover_decay=float(
+                                    a_cfg.get("surface_tip_est_holdover_decay", 0.7)
+                                    or 0.7
+                                ),
+                                seat_only_offset=bool(
+                                    a_cfg.get("surface_tip_est_seat_only_offset", True)
+                                ),
+                                freeze_require_seat=bool(
+                                    a_cfg.get(
+                                        "surface_tip_est_freeze_require_seat", True
+                                    )
+                                ),
+                            )
+                            # Prefer contact seed; tip_sp0 only if no peg↔tray contact.
+                            _allow_seed = bool(
+                                a_cfg.get("surface_tip_est_allow_gt_seed", False)
+                            )
+                            tip_est.reset(
+                                raw,
+                                wrist_pos=site_sp[0:3],
+                                plane_n=spiral_n,
+                                tip_seed=tip_sp0 if _allow_seed else None,
+                            )
+                            tip_est_wrist_prev = (
+                                np.asarray(site_sp[0:3], dtype=np.float64)
+                                .reshape(3)
+                                .copy()
+                            )
+                        elif tip_obs_enable:
+                            # INVALID path (tip_gt+noise); kept for tree compatibility.
+                            tip_oracle_enable = True
+                            if tip_baseline_mode not in (
+                                "priv_oracle_tip_servo",
+                                "oracle_tip",
+                                "oracle",
+                                "priv_oracle_tip_obs",
+                            ):
+                                tip_baseline_mode = "priv_oracle_tip_obs"
+                            elif tip_baseline_mode != "priv_oracle_tip_obs":
+                                tip_baseline_mode = "priv_oracle_tip_obs"
+                        if tip_oracle_enable and tip_baseline_mode not in (
+                            "priv_oracle_tip_servo",
+                            "oracle_tip",
+                            "oracle",
+                            "priv_oracle_tip_obs",
+                            "track_a_est_oracle",
+                            "est_oracle_tip_servo",
+                            "est_oracle",
+                            "track_a_theory_est",
+                            "track_a_theory_ekf",
+                            "theory_est_oracle",
+                            "tec_slim_oracle",
+                            "track_a_tip_axis",
+                            "track_a_tip_axis_ekf",
+                            "tip_axis_oracle",
+                            "tec_tip_axis_oracle",
+                        ):
+                            tip_baseline_mode = "priv_oracle_tip_servo"
+                        # Episode-stable tip-obs RNG (socket_off already episode-specific).
+                        tip_obs_lag_buf: list[np.ndarray] = []
+                        tip_obs_rng: np.random.Generator | None = None
+                        if tip_obs_enable:
+                            _obs_seed = int(a_cfg.get("surface_tip_obs_seed", 0) or 0)
+                            _off = np.asarray(socket_off, dtype=np.float64).reshape(-1)
+                            _mix = (
+                                _obs_seed
+                                + abs(int(np.round(float(_off[0]) * 1e9)))
+                                + abs(int(np.round(float(_off[1]) * 1e7)))
+                            )
+                            tip_obs_rng = np.random.default_rng(int(_mix) & 0x7FFFFFFF)
+                        tip_coupling_est: TipCouplingEstimator | None = None
+                        tip_planar_coupling_est: PlanarCouplingEstimator | None = None
+                        tip_coupling_ekf: CouplingEKF | None = None
+                        _phig_mode = tip_baseline_mode in (
+                            "track_b_phig",
+                            "phig",
+                            "track_b",
+                            "path_hybrid_grasp",
+                        )
+                        _hard_hqp_mode = tip_baseline_mode in (
+                            "fail_driven_hard_hqp",
+                            "hard_hqp",
+                            "track_b_hard_hqp",
+                            "escande_hard_hqp",
+                        )
+                        _clep_mode = tip_baseline_mode in (
+                            "track_b_clep",
+                            "clep",
+                            "contact_line_extrinsic_pivot",
+                            "active_extrinsic_clep",
+                        )
+                        _fasr_mode = tip_baseline_mode in (
+                            "track_b_fasr",
+                            "fasr",
+                            "force_asymmetry_spiral_recenter",
+                            "force_guided_radial_seek",
+                        )
+                        _oigs_mode = tip_baseline_mode in (
+                            "track_b_oigs",
+                            "oigs",
+                            "object_impedance_grasp_stiff",
+                            "pfanne_grasp_stiff",
+                        )
+                        _gmhqp_mode = tip_baseline_mode in (
+                            "track_b_gmhqp",
+                            "gmhqp",
+                            "grasp_map_hqp",
+                            "grasp_map_operational_hqp",
+                            "object_task_hqp",
+                            "track_a_gmhqp_tip_obs",
+                            "gmhqp_tip_obs",
+                            "track_a_gmhqp",
+                            "track_a_gmhqp_tip_fuse",
+                            "gmhqp_tip_fuse",
+                            "track_a_tec_joint_gmhqp",
+                            "tec_joint_gmhqp",
+                            "tec_joint",
+                            "track_a_tec_joint",
+                            "gmhqp_tec_joint",
+                        ) or bool(tip_gmhqp_tip_obs)
+                        _gmhqp_ftip_mode = tip_baseline_mode in (
+                            "track_b_gmhqp_ftip",
+                            "gmhqp_ftip",
+                            "gmhqp_ft_contact",
+                            "gmhqp_ft_tip",
+                            "grasp_map_hqp_ftip",
+                        )
+                        _gmhqp_compc_mode = tip_baseline_mode in (
+                            "track_b_gmhqp_compc",
+                            "gmhqp_compc",
+                            "gmhqp_contact_opt",
+                            "track_b_contact_opt_gmhqp",
+                            "contact_opt_on_gmhqp",
+                        )
+                        _gmhqp_ac_mode = tip_baseline_mode in (
+                            "track_b_gmhqp_ac",
+                            "gmhqp_ac",
+                            "adaptive_c_gmhqp",
+                            "track_b_adaptive_c",
+                            "gmhqp_adaptive_c",
+                        )
+                        _hybrid_gmhqp_mode = tip_baseline_mode in (
+                            "track_b_hybrid_gmhqp",
+                            "hybrid_gmhqp",
+                            "gmhqp_hybrid",
+                            "tip_planar_c_hybrid_hqp",
+                            "escande_hybrid_gmhqp",
+                        )
+                        _planar_c_mode = (
+                            tip_baseline_mode
+                            in (
+                                "planar_c",
+                                "planar_c_matrix",
+                                "s8",
+                                "ekf_qp",
+                                "s9",
+                            )
+                            or (
+                                bool(a_cfg.get("surface_tip_coupling_planar_c", False))
+                                and tip_baseline_mode
+                                not in (
+                                    "priv_coupling",
+                                    "coupling",
+                                    "ours",
+                                    "c",
+                                    "priv_oracle_tip_servo",
+                                    "oracle_tip",
+                                    "oracle",
+                                    "priv_oracle_tip_obs",
+                                    "track_a_est_oracle",
+                                    "est_oracle_tip_servo",
+                                    "est_oracle",
+                                    "track_a_theory_est",
+                                    "track_a_theory_ekf",
+                                    "theory_est_oracle",
+                                    "tec_slim_oracle",
+                                    "track_a_tip_axis",
+                                    "track_a_tip_axis_ekf",
+                                    "tip_axis_oracle",
+                                    "tec_tip_axis_oracle",
+                                    "track_b_phig",
+                                    "phig",
+                                    "track_b",
+                                    "path_hybrid_grasp",
+                                    "fail_driven_hard_hqp",
+                                    "hard_hqp",
+                                    "track_b_hard_hqp",
+                                    "escande_hard_hqp",
+                                    "track_b_clep",
+                                    "clep",
+                                    "contact_line_extrinsic_pivot",
+                                    "active_extrinsic_clep",
+                                    "track_b_fasr",
+                                    "fasr",
+                                    "force_asymmetry_spiral_recenter",
+                                    "force_guided_radial_seek",
+                                    "track_b_oigs",
+                                    "oigs",
+                                    "object_impedance_grasp_stiff",
+                                    "pfanne_grasp_stiff",
+                                    "track_b_gmhqp",
+                                    "gmhqp",
+                                    "grasp_map_hqp",
+                                    "grasp_map_operational_hqp",
+                                    "object_task_hqp",
+                                    "track_a_gmhqp_tip_obs",
+                                    "gmhqp_tip_obs",
+                                    "track_a_gmhqp",
+                                    "track_a_gmhqp_tip_fuse",
+                                    "gmhqp_tip_fuse",
+                                    "track_a_tec_joint_gmhqp",
+                                    "tec_joint_gmhqp",
+                                    "tec_joint",
+                                    "track_a_tec_joint",
+                                    "gmhqp_tec_joint",
+                                    "track_b_gmhqp_ftip",
+                                    "gmhqp_ftip",
+                                    "gmhqp_ft_contact",
+                                    "gmhqp_ft_tip",
+                                    "grasp_map_hqp_ftip",
+                                    "track_b_gmhqp_compc",
+                                    "gmhqp_compc",
+                                    "gmhqp_contact_opt",
+                                    "track_b_contact_opt_gmhqp",
+                                    "contact_opt_on_gmhqp",
+                                    "track_b_gmhqp_ac",
+                                    "gmhqp_ac",
+                                    "adaptive_c_gmhqp",
+                                    "track_b_adaptive_c",
+                                    "gmhqp_adaptive_c",
+                                    "track_b_hybrid_gmhqp",
+                                    "hybrid_gmhqp",
+                                    "gmhqp_hybrid",
+                                    "tip_planar_c_hybrid_hqp",
+                                    "escande_hybrid_gmhqp",
+                                )
+                            )
+                        ) and (not tip_oracle_enable) and (not _phig_mode) and (
+                            not _hard_hqp_mode
+                        ) and (not _clep_mode) and (not _fasr_mode) and (
+                            not _oigs_mode
+                        ) and (not _gmhqp_mode) and (not _gmhqp_ftip_mode) and (
+                            not _gmhqp_compc_mode
+                        ) and (not _gmhqp_ac_mode) and (
+                            not _hybrid_gmhqp_mode
+                        )
+                        if tip_baseline_mode in ("ekf_qp", "s9"):
+                            tip_coupling_ekf = CouplingEKF(
+                                slip_ratio=float(
+                                    a_cfg.get("surface_tip_ekf_slip_ratio", 0.25)
+                                ),
+                                slip_dw_m=float(
+                                    a_cfg.get(
+                                        "surface_tip_coupling_slip_reset_dw_m",
+                                        0.0012,
+                                    )
+                                ),
+                                alpha_floor=float(
+                                    a_cfg.get(
+                                        "surface_tip_coupling_alpha_floor", 0.18
+                                    )
+                                ),
+                                alpha_ceil=float(
+                                    a_cfg.get("surface_tip_coupling_alpha_ceil", 1.05)
+                                ),
+                            )
+                            tip_coupling_ekf.reset(site_sp[0:3], tip_sp0, spiral_n)
+                        elif _planar_c_mode:
+                            tip_planar_coupling_est = PlanarCouplingEstimator(
+                                window=int(
+                                    a_cfg.get("surface_tip_coupling_window", 24)
+                                ),
+                                c_reg=float(
+                                    a_cfg.get("surface_tip_coupling_c_reg", 0.15)
+                                ),
+                                alpha_floor=float(
+                                    a_cfg.get(
+                                        "surface_tip_coupling_alpha_floor", 0.18
+                                    )
+                                ),
+                            )
+                            tip_planar_coupling_est.reset(site_sp[0:3], tip_sp0)
+                            if tip_baseline_mode not in (
+                                "planar_c",
+                                "planar_c_matrix",
+                                "s8",
+                            ):
+                                tip_baseline_mode = "planar_c"
+                        elif tip_baseline_mode in (
+                            "priv_coupling",
+                            "coupling",
+                            "ours",
+                            "c",
+                            "planar_coupling",
+                            "s7",
+                        ):
+                            tip_coupling_est = TipCouplingEstimator(
+                                window=int(
+                                    a_cfg.get("surface_tip_coupling_window", 24)
+                                ),
+                                ema_offset=float(
+                                    a_cfg.get("surface_tip_coupling_ema", 0.88)
+                                ),
+                                alpha_floor=float(
+                                    a_cfg.get(
+                                        "surface_tip_coupling_alpha_floor", 0.18
+                                    )
+                                ),
+                            )
+                            tip_coupling_est.reset(site_sp[0:3], tip_sp0)
                         search_mode = str(
                             a_cfg.get("surface_tip_search_mode", "spiral")
                         ).strip().lower()
                         _priv_lat_modes = ("priv_lat", "priv_lat_lissajous")
                         if search_mode not in (
                             "spiral",
+                            "planned_spiral",
+                            "conntact_time_spiral",
+                            "franka_spiral",
+                            "psft_spiral",
                             "lissajous",
                             *_priv_lat_modes,
                         ):
                             search_mode = "spiral"
+                        conntact_faithful = search_mode == "conntact_time_spiral"
+                        franka_faithful = search_mode == "franka_spiral"
+                        psft_faithful = search_mode == "psft_spiral"
+                        conntact_params = ConnTactSpiralParams(
+                            frequency_hz=float(
+                                a_cfg.get("surface_conntact_frequency_hz", 0.15)
+                            ),
+                            min_amplitude_m=float(
+                                a_cfg.get("surface_conntact_min_amplitude_m", 0.002)
+                            ),
+                            max_cycles=float(
+                                a_cfg.get("surface_conntact_max_cycles", 62.83)
+                            ),
+                            safe_clearance_m=float(
+                                a_cfg.get(
+                                    "surface_conntact_safe_clearance_m",
+                                    0.02 / 100.0,
+                                )
+                            ),
+                            height_drop_m=float(
+                                a_cfg.get("surface_conntact_height_drop_m", 0.0004)
+                            ),
+                        )
+                        conntact_dt = float(
+                            a_cfg.get("surface_conntact_dt_s", 1.0 / 30.0)
+                        )
+                        conntact_surface_h: float | None = None
+                        conntact_height_enter = bool(
+                            a_cfg.get("surface_conntact_height_enter", True)
+                        )
+                        # Soft-sim force scale: ref FORCE_THRESHOLD_N=2.0; default
+                        # 0.05 matches planar jam/stuck band (disclose in doc).
+                        franka_params = FrankaSpiralParams(
+                            force_threshold_n=float(
+                                a_cfg.get("surface_franka_force_threshold_n", 0.08)
+                            ),
+                            r_base_m=float(
+                                a_cfg.get("surface_franka_r_base_m", 0.0002)
+                            ),
+                            r_growth_m=float(
+                                a_cfg.get("surface_franka_r_growth_m", 0.0002)
+                            ),
+                            r_max_m=float(
+                                a_cfg.get("surface_franka_r_max_m", 0.015)
+                            ),
+                            omega_rad=float(
+                                a_cfg.get("surface_franka_omega_rad", 0.4)
+                            ),
+                            jam_lift_above_hole_m=float(
+                                a_cfg.get("surface_franka_jam_lift_m", 0.040)
+                            ),
+                            insert_z_ramp_per_step_m=float(
+                                a_cfg.get(
+                                    "surface_franka_insert_z_ramp_m", 0.0005
+                                )
+                            ),
+                            height_drop_m=float(
+                                a_cfg.get("surface_franka_height_drop_m", 0.0004)
+                            ),
+                        )
+                        franka_state = FrankaSpiralState()
+                        franka_surface_h: float | None = None
+                        franka_height_enter = bool(
+                            a_cfg.get("surface_franka_height_enter", True)
+                        )
+                        franka_meta_last: dict = {}
+                        if franka_faithful and not tip_baseline_mode:
+                            tip_baseline_mode = "franka_tcp"
+                        # Park RA-L 2020 PSFT (paper reimpl; no official code).
+                        psft_params = PSFTParams(
+                            h_m=float(a_cfg.get("surface_psft_h_m", 0.0005)),
+                            d_m=float(a_cfg.get("surface_psft_d_m", 0.002)),
+                            r_min_m=float(a_cfg.get("surface_psft_r_min_m", 0.001)),
+                            r_max_m=float(a_cfg.get("surface_psft_r_max_m", 0.018)),
+                            theta_max_rad=float(
+                                a_cfg.get("surface_psft_theta_max_rad", 0.5 * np.pi)
+                            ),
+                            k_p=float(a_cfg.get("surface_psft_k_p", 300.0)),
+                            k_omega=float(a_cfg.get("surface_psft_k_omega", 3.0)),
+                            f_a_n=float(a_cfg.get("surface_psft_f_a_n", 7.0)),
+                            tilt_rad=float(a_cfg.get("surface_psft_tilt_rad", 0.17)),
+                            dt_s=float(a_cfg.get("surface_psft_dt_s", 0.003)),
+                            height_drop_m=float(
+                                a_cfg.get("surface_psft_height_drop_m", 0.0004)
+                            ),
+                        )
+                        psft_state = PSFTState()
+                        psft_state.reset(r_min_m=float(psft_params.r_min_m))
+                        psft_surface_h: float | None = None
+                        psft_height_enter = bool(
+                            a_cfg.get("surface_psft_height_enter", True)
+                        )
+                        psft_meta_last: dict = {}
+                        if psft_faithful and not tip_baseline_mode:
+                            tip_baseline_mode = "psft_tcp"
                         n_sp = int(a_cfg.get("surface_spiral_frames", 180))
                         if search_mode in _priv_lat_modes:
                             n_search = int(
@@ -2614,13 +4104,78 @@ def run_pbvs_biased_surface_press(
                             )
                         else:
                             n_search = n_sp
-                        if search_mode in ("lissajous", *_priv_lat_modes):
-                            spiral_center = _hole_axis_point_at_tip(
-                                tip_sp0,
-                                feat_sp0.socket_pos,
-                                feat_sp0.hole_axis,
+                        # Lissajous/priv_lat default to socket center; tip-centered
+                        # ablation keeps pattern on current tip (no hole seek center).
+                        want_tip_center = (
+                            str(a_cfg.get("surface_tip_spiral_center", "tip"))
+                            .strip()
+                            .lower()
+                            == "tip"
+                        )
+                        if (
+                            search_mode in ("lissajous", *_priv_lat_modes)
+                            or conntact_faithful
+                            or franka_faithful
+                            or psft_faithful
+                        ):
+                            if (
+                                want_tip_center
+                                and search_mode == "lissajous"
+                                and not conntact_faithful
+                                and not franka_faithful
+                                and not psft_faithful
+                            ):
+                                spiral_center = tip_sp0.copy()
+                                spiral_center_mode = "tip"
+                            else:
+                                # ConnTact/Franka/PSFT center spiral on known hole XY.
+                                spiral_center = _hole_axis_point_at_tip(
+                                    tip_sp0,
+                                    feat_sp0.socket_pos,
+                                    feat_sp0.hole_axis,
+                                )
+                                spiral_center_mode = "socket"
+                        if conntact_faithful:
+                            # ConnTact exit uses TCP world-Z vs surface_height.
+                            conntact_surface_h = float(tip_sp0[2])
+                            print(
+                                f"pci: ConnTact faithful time-spiral "
+                                f"f={conntact_params.frequency_hz}Hz "
+                                f"amp0={conntact_params.min_amplitude_m*1e3:.2f}mm "
+                                f"clear={conntact_params.safe_clearance_m*1e3:.3f}mm "
+                                f"drop={conntact_params.height_drop_m*1e3:.2f}mm "
+                                f"surface_z={conntact_surface_h:.5f}",
+                                flush=True,
                             )
-                            spiral_center_mode = "socket"
+                        if franka_faithful:
+                            franka_surface_h = float(tip_sp0[2])
+                            franka_state.reset()
+                            print(
+                                f"pci: Franka faithful jam-spiral "
+                                f"Fth={franka_params.force_threshold_n:.3f}N "
+                                f"r0={franka_params.r_base_m*1e3:.2f}mm "
+                                f"dr={franka_params.r_growth_m*1e3:.2f}mm "
+                                f"rmax={franka_params.r_max_m*1e3:.1f}mm "
+                                f"ω={franka_params.omega_rad:.2f} "
+                                f"lift={franka_params.jam_lift_above_hole_m*1e3:.1f}mm "
+                                f"surface_z={franka_surface_h:.5f}",
+                                flush=True,
+                            )
+                        if psft_faithful:
+                            psft_surface_h = float(tip_sp0[2])
+                            psft_state.reset(r_min_m=float(psft_params.r_min_m))
+                            print(
+                                f"pci: PSFT paper-reimpl (no official code) "
+                                f"θmax={psft_params.theta_max_rad:.3f} "
+                                f"h={psft_params.h_m*1e3:.2f}mm "
+                                f"d={psft_params.d_m*1e3:.2f}mm "
+                                f"r=[{psft_params.r_min_m*1e3:.1f},"
+                                f"{psft_params.r_max_m*1e3:.1f}]mm "
+                                f"kp={psft_params.k_p:.0f} "
+                                f"fa_paper={psft_params.f_a_n:.1f}N "
+                                f"surface_z={psft_surface_h:.5f}",
+                                flush=True,
+                            )
                         mouth_lat = float(
                             a_cfg.get("surface_spiral_mouth_lat_m", 0.0045)
                         )
@@ -2658,12 +4213,41 @@ def run_pbvs_biased_surface_press(
                         left_share_sp = float(
                             a_cfg.get("surface_spiral_left_share", 0.05)
                         )
+                        # ConnTact uses cartesian compliance while spiraling; we
+                        # mirror with dual-arm yield: left shares planar motion +
+                        # wrist admittance so the tray gives instead of stiction.
+                        if search_mode == "planned_spiral":
+                            # No open-loop share: left yields only via wrist FT admit.
+                            left_share_sp = float(
+                                a_cfg.get("surface_planned_spiral_left_share", 0.0)
+                            )
+                        spiral_left_admit_scale = float(
+                            a_cfg.get(
+                                "surface_spiral_left_admit_scale",
+                                1.0 if search_mode == "planned_spiral" else 0.0,
+                            )
+                        )
+                        spiral_admit: LeftWristAdmitController | None = None
+                        if spiral_left_admit_scale > 1e-9:
+                            spiral_admit = LeftWristAdmitController(
+                                _left_wrist_admit_config(cfg)
+                            )
+                            wr_ad0 = read_wrist_wrench_world(raw)
+                            spiral_admit.reset(wr_ad0[1])
                         spiral_lat_min = float(feat_sp0.lateral_m)
                         spiral_resid_peak = 0.0
                         spiral_reason = "spiral_timeout"
                         tip_xy_peak = 0.0
+                        # Honest seat/orientation audit during tip spiral search.
+                        spiral_tip_float_peak_m = 0.0
+                        spiral_axis_err_peak_deg = 0.0
+                        spiral_contact_ok_n = 0
+                        spiral_contact_frames = 0
+                        seat_contact_n = float(
+                            a_cfg.get("surface_planned_seat_contact_n", 0.08)
+                        )
                         off0_xy = _tip_lat_offset_xy(
-                            tip_sp0, spiral_center, feat_sp0.hole_axis
+                            tip_sp0, spiral_center, spiral_n
                         )
                         r_start = float(np.linalg.norm(off0_xy))
                         theta_sp = (
@@ -2723,6 +4307,10 @@ def run_pbvs_biased_surface_press(
                                 a_cfg.get("mouth_max_along_m", 0.102),
                             )
                         )
+                        # Tip/socket spiral: keep search on the contact plane (ConnTact).
+                        spiral_along_hold = bool(
+                            a_cfg.get("surface_spiral_along_hold", True)
+                        )
                         along_hold_m: float | None = None
                         stick_enable = bool(
                             a_cfg.get("surface_priv_lat_stick_enable", True)
@@ -2767,6 +4355,12 @@ def run_pbvs_biased_surface_press(
                         stick_slide_step = float(
                             a_cfg.get("surface_priv_lat_stick_slide_step_m", 0.004)
                         )
+                        stick_press_frames = int(
+                            a_cfg.get("surface_priv_lat_stick_press_frames", 16)
+                        )
+                        stick_hop_probe = bool(
+                            a_cfg.get("surface_priv_lat_hop_probe", False)
+                        )
                         stick_clear_lift = float(
                             a_cfg.get("surface_priv_lat_stick_clear_lift_m", 0.003)
                         )
@@ -2774,6 +4368,1037 @@ def run_pbvs_biased_surface_press(
                             a_cfg.get("surface_priv_lat_stick_clear_contact_n", 0.06)
                         )
                         tip_hist_sp: list[np.ndarray] = []
+                        # Privileged planned on-surface enter spiral (FF waypoints).
+                        planned_wps = None
+                        planned_rs = None
+                        planned_ths = None
+                        planned_i = 0
+                        catch_miss_sp = 0
+                        along0_spiral = float(feat_sp0.along_m)
+                        priv_mouth_streak = 0
+                        priv_enter_streak = 0
+                        priv_hole_entered = False
+                        priv_at_mouth_peak = False
+                        force_hole_detect = bool(
+                            a_cfg.get("surface_planned_force_hole_detect", False)
+                        )
+                        tip_hybrid_enable = bool(
+                            a_cfg.get("surface_tip_hybrid_enable", True)
+                        )
+                        tip_hybrid_state = TipHybridState()
+                        tip_hybrid_omega = np.zeros(3, dtype=np.float64)
+                        tip_hybrid_soft_seat = False
+                        tip_hybrid_mode_counts = {"seat": 0, "upright": 0, "spiral": 0}
+                        tip_msar_enable = bool(a_cfg.get("surface_tip_msar_enable", False))
+                        tip_msar_counts = {
+                            "mouth_seek": 0,
+                            "slip_reseat": 0,
+                            "spiral_track": 0,
+                        }
+                        # Tip-STAR supersedes MSAR when enabled (no privileged mouth PD).
+                        tip_star_enable = bool(
+                            a_cfg.get("surface_tip_star_enable", False)
+                        )
+                        # Deployable Type-B slip restore: can run alone or under STAR.
+                        tip_slip_enable = bool(
+                            a_cfg.get("surface_tip_slip_enable", False)
+                        ) or tip_star_enable
+                        if tip_star_enable:
+                            tip_msar_enable = False
+                        # Track-B PHIG: wrist-path + deployable mouth/slip (no tip GT).
+                        tip_phig_enable = bool(
+                            a_cfg.get("surface_tip_phig_enable", False)
+                        ) or bool(_phig_mode)
+                        phig_state = PhigState()
+                        phig_cfg = PhigConfig(
+                            k_path=float(a_cfg.get("surface_tip_phig_k_path", 1.6)),
+                            k_tang_admit=float(
+                                a_cfg.get("surface_tip_phig_k_tang_admit", 0.00025)
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_phig_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_seat_contact_n", 0.05
+                                )
+                            ),
+                            f_mouth_press_n=float(
+                                a_cfg.get("surface_tip_phig_f_mouth_press_n", 0.08)
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get("surface_tip_phig_mouth_r_m", 0.0045)
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get("surface_tip_phig_mouth_press_m", 0.00045)
+                            ),
+                            mouth_hard_unload_n=float(
+                                a_cfg.get(
+                                    "surface_tip_phig_mouth_hard_unload_n", 0.90
+                                )
+                            ),
+                            slip_tau_m=float(
+                                a_cfg.get("surface_tip_phig_slip_tau_m", 0.12)
+                            ),
+                            reseat_frames=int(
+                                a_cfg.get("surface_tip_phig_reseat_frames", 40)
+                            ),
+                            retrip_delta_m=float(
+                                a_cfg.get("surface_tip_phig_retrip_delta_m", 0.05)
+                            ),
+                            grasp_scale=float(
+                                a_cfg.get("surface_tip_phig_grasp_scale", 1.55)
+                            ),
+                            hold_enter_max_axis_deg=float(
+                                a_cfg.get(
+                                    "surface_tip_phig_hold_enter_max_axis_deg",
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_max_axis_err_deg",
+                                        25.0,
+                                    ),
+                                )
+                            ),
+                        )
+                        # Fail-driven Track-B HardHQP (seat ≻ upright ≻ path).
+                        tip_hard_hqp_enable = bool(
+                            a_cfg.get("surface_tip_hard_hqp_enable", False)
+                        ) or bool(_hard_hqp_mode)
+                        hard_hqp_cfg = HardHqpConfig(
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_press_m", 0.00045
+                                    ),
+                                )
+                            ),
+                            upright_soft_deg=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_upright_soft_deg",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_upright_soft_deg", 16.0
+                                    ),
+                                )
+                            ),
+                            upright_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_upright_step_m", 0.004
+                                )
+                            ),
+                            path_k=float(
+                                a_cfg.get("surface_tip_hard_hqp_path_k", 1.4)
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_mouth_r_m", 0.0045
+                                )
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_mouth_press_m", 0.00045
+                                )
+                            ),
+                            path_when_hard=float(
+                                a_cfg.get(
+                                    "surface_tip_hard_hqp_path_when_hard", 0.0
+                                )
+                            ),
+                        )
+                        # Track-B CLEP: F/T contact-line extrinsic pivot (no tip GT).
+                        tip_clep_enable = bool(
+                            a_cfg.get("surface_tip_clep_enable", False)
+                        ) or bool(_clep_mode)
+                        clep_state = ClepState()
+                        clep_cfg = ClepConfig(
+                            k_contact=float(
+                                a_cfg.get("surface_tip_clep_k_contact", 1.8)
+                            ),
+                            k_wrist_fallback=float(
+                                a_cfg.get("surface_tip_clep_k_wrist_fallback", 0.6)
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_clep_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            ema=float(a_cfg.get("surface_tip_clep_ema", 0.55)),
+                            f_min_n=float(a_cfg.get("surface_tip_clep_f_min_n", 0.02)),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_clep_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_clep_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_press_m", 0.00045
+                                    ),
+                                )
+                            ),
+                            seat_path_scale=float(
+                                a_cfg.get("surface_tip_clep_seat_path_scale", 0.15)
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get("surface_tip_clep_mouth_r_m", 0.0045)
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get("surface_tip_clep_mouth_press_m", 0.00045)
+                            ),
+                            f_mouth_press_n=float(
+                                a_cfg.get("surface_tip_clep_f_mouth_press_n", 0.08)
+                            ),
+                            max_contact_offset_m=float(
+                                a_cfg.get(
+                                    "surface_tip_clep_max_contact_offset_m", 0.08
+                                )
+                            ),
+                            tang_gate_n=float(
+                                a_cfg.get("surface_tip_clep_tang_gate_n", 0.55)
+                            ),
+                            tang_path_scale=float(
+                                a_cfg.get("surface_tip_clep_tang_path_scale", 0.35)
+                            ),
+                        )
+                        # Track-B FASR: F/T edge bias + spiral-center recenter (F1).
+                        tip_fasr_enable = bool(
+                            a_cfg.get("surface_tip_fasr_enable", False)
+                        ) or bool(_fasr_mode)
+                        fasr_state = FasrState()
+                        fasr_cfg = FasrConfig(
+                            k_path=float(a_cfg.get("surface_tip_fasr_k_path", 1.5)),
+                            k_force=float(a_cfg.get("surface_tip_fasr_k_force", 0.004)),
+                            f_edge_n=float(a_cfg.get("surface_tip_fasr_f_edge_n", 0.08)),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_fasr_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_fasr_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_press_m", 0.00045
+                                    ),
+                                )
+                            ),
+                            seat_path_scale=float(
+                                a_cfg.get("surface_tip_fasr_seat_path_scale", 0.25)
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_fasr_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            recenter_ema=float(
+                                a_cfg.get("surface_tip_fasr_recenter_ema", 0.08)
+                            ),
+                            recenter_step_m=float(
+                                a_cfg.get("surface_tip_fasr_recenter_step_m", 0.00035)
+                            ),
+                            recenter_cap_m=float(
+                                a_cfg.get("surface_tip_fasr_recenter_cap_m", 0.012)
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get("surface_tip_fasr_mouth_r_m", 0.006)
+                            ),
+                            f_mouth_drop_n=float(
+                                a_cfg.get("surface_tip_fasr_f_mouth_drop_n", 0.035)
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get("surface_tip_fasr_mouth_press_m", 0.0005)
+                            ),
+                            mouth_path_scale=float(
+                                a_cfg.get("surface_tip_fasr_mouth_path_scale", 0.4)
+                            ),
+                        )
+                        # Track-B OIGS: refresh equation knobs after baseline parse.
+                        tip_oigs_enable = bool(
+                            a_cfg.get("surface_tip_oigs_enable", False)
+                        ) or bool(_oigs_mode)
+                        oigs_cfg = OigsConfig(
+                            k_path=float(a_cfg.get("surface_tip_oigs_k_path", 1.4)),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_oigs_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            e_rigid_rad=float(
+                                a_cfg.get("surface_tip_oigs_e_rigid_rad", 0.12)
+                            ),
+                            e_rigid_pos_m=float(
+                                a_cfg.get("surface_tip_oigs_e_rigid_pos_m", 0.008)
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_oigs_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_oigs_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_press_m", 0.00045
+                                    ),
+                                )
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get("surface_tip_oigs_mouth_r_m", 0.0045)
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get("surface_tip_oigs_mouth_press_m", 0.0004)
+                            ),
+                            alpha_floor=float(
+                                a_cfg.get("surface_tip_oigs_alpha_floor", 0.05)
+                            ),
+                        )
+                        if tip_oigs_enable:
+                            meta["tip_oigs_enable"] = True
+                            meta["tip_oigs_theory"] = "pfanne_RA-L_2020+graspqp"
+                        # Track-B GMHQP: tip-task through grasp-map C (Escande HQP).
+                        tip_gmhqp_enable = bool(
+                            a_cfg.get("surface_tip_gmhqp_enable", False)
+                        ) or bool(_gmhqp_mode)
+                        gmhqp_cfg = GmhqpConfig(
+                            k_tip=float(a_cfg.get("surface_tip_gmhqp_k_tip", 1.4)),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_press_m", 0.00045
+                                    ),
+                                )
+                            ),
+                            upright_soft_deg=float(
+                                a_cfg.get("surface_tip_gmhqp_upright_soft_deg", 16.0)
+                            ),
+                            upright_step_m=float(
+                                a_cfg.get("surface_tip_gmhqp_upright_step_m", 0.004)
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get("surface_tip_gmhqp_mouth_r_m", 0.0045)
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get("surface_tip_gmhqp_mouth_press_m", 0.0004)
+                            ),
+                            c_ridge=float(
+                                a_cfg.get("surface_tip_gmhqp_c_ridge", 0.35)
+                            ),
+                            c_ema=float(a_cfg.get("surface_tip_gmhqp_c_ema", 0.85)),
+                        )
+                        if tip_gmhqp_enable:
+                            meta["tip_gmhqp_enable"] = True
+                            meta["tip_gmhqp_theory"] = (
+                                "montana_grasp_map+pfanne+escande_hqp"
+                            )
+                            # Pose-hold GraspQP needed for finger side of G.
+                            if tip_search_pose_hold and use_priv_grasp_a:
+                                meta["tip_gmhqp_pose_hold"] = True
+                        # Track-B GMHQP-FTIP: FT extrinsic tip → same GMHQP law (REUSE).
+                        tip_gmhqp_ftip_enable = bool(
+                            a_cfg.get("surface_tip_gmhqp_ftip_enable", False)
+                        ) or bool(_gmhqp_ftip_mode)
+                        gmhqp_ftip_state = GmhqpFtipState()
+                        gmhqp_ftip_cfg = GmhqpFtipConfig(
+                            k_tip=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_k_tip",
+                                    a_cfg.get("surface_tip_gmhqp_k_tip", 1.4),
+                                )
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_max_step_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_max_step_m",
+                                        a_cfg.get(
+                                            "surface_planned_spiral_max_wrist_step_m",
+                                            0.012,
+                                        ),
+                                    ),
+                                )
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_f_seat_n",
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_contact_n", 0.05
+                                        ),
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_seat_press_m",
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_press_m", 0.00045
+                                        ),
+                                    ),
+                                )
+                            ),
+                            upright_soft_deg=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_upright_soft_deg",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_upright_soft_deg", 16.0
+                                    ),
+                                )
+                            ),
+                            upright_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_upright_step_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_upright_step_m", 0.004
+                                    ),
+                                )
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_mouth_r_m",
+                                    a_cfg.get("surface_tip_gmhqp_mouth_r_m", 0.0045),
+                                )
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_mouth_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_mouth_press_m", 0.0004
+                                    ),
+                                )
+                            ),
+                            c_ridge=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_c_ridge",
+                                    a_cfg.get("surface_tip_gmhqp_c_ridge", 0.35),
+                                )
+                            ),
+                            c_ema=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_c_ema",
+                                    a_cfg.get("surface_tip_gmhqp_c_ema", 0.85),
+                                )
+                            ),
+                            ft_ema=float(
+                                a_cfg.get("surface_tip_gmhqp_ftip_ft_ema", 0.55)
+                            ),
+                            ft_f_min_n=float(
+                                a_cfg.get("surface_tip_gmhqp_ftip_f_min_n", 0.02)
+                            ),
+                            ft_max_lever_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ftip_max_lever_m", 0.08
+                                )
+                            ),
+                        )
+                        if tip_gmhqp_ftip_enable:
+                            meta["tip_gmhqp_ftip_enable"] = True
+                            meta["tip_gmhqp_ftip_theory"] = (
+                                "doshi_ft_contact+montana_gmhqp_escande"
+                            )
+                            if tip_search_pose_hold and use_priv_grasp_a:
+                                meta["tip_gmhqp_ftip_pose_hold"] = True
+                        # Track-B CompC: contact short-horizon MPC on GMHQP (ĉ in cost only).
+                        tip_gmhqp_compc_enable = bool(
+                            a_cfg.get("surface_tip_gmhqp_compc_enable", False)
+                        ) or bool(_gmhqp_compc_mode)
+                        gmhqp_compc_state = GmhqpCompcState()
+                        gmhqp_compc_cfg = GmhqpCompcConfig(
+                            k_tip=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_k_tip",
+                                    a_cfg.get("surface_tip_gmhqp_k_tip", 1.4),
+                                )
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_max_step_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_max_step_m",
+                                        a_cfg.get(
+                                            "surface_planned_spiral_max_wrist_step_m",
+                                            0.012,
+                                        ),
+                                    ),
+                                )
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_f_seat_n",
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_contact_n", 0.05
+                                        ),
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_seat_press_m",
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_press_m", 0.00045
+                                        ),
+                                    ),
+                                )
+                            ),
+                            upright_soft_deg=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_upright_soft_deg",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_upright_soft_deg", 16.0
+                                    ),
+                                )
+                            ),
+                            upright_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_upright_step_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_upright_step_m", 0.004
+                                    ),
+                                )
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_mouth_r_m",
+                                    a_cfg.get("surface_tip_gmhqp_mouth_r_m", 0.0045),
+                                )
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_mouth_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_mouth_press_m", 0.0004
+                                    ),
+                                )
+                            ),
+                            c_ridge=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_c_ridge",
+                                    a_cfg.get("surface_tip_gmhqp_c_ridge", 0.35),
+                                )
+                            ),
+                            c_ema=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_c_ema",
+                                    a_cfg.get("surface_tip_gmhqp_c_ema", 0.85),
+                                )
+                            ),
+                            horizon=int(
+                                a_cfg.get("surface_tip_gmhqp_compc_horizon", 4)
+                            ),
+                            w_tip=float(
+                                a_cfg.get("surface_tip_gmhqp_compc_w_tip", 1.0)
+                            ),
+                            w_contact=float(
+                                a_cfg.get("surface_tip_gmhqp_compc_w_contact", 1.2)
+                            ),
+                            w_u=float(
+                                a_cfg.get("surface_tip_gmhqp_compc_w_u", 0.08)
+                            ),
+                            sigma_false_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_sigma_false_m", 0.005
+                                )
+                            ),
+                            f_des_n=float(
+                                a_cfg.get("surface_tip_gmhqp_compc_f_des_n", 0.08)
+                            ),
+                            k_force_m_per_n=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_k_force_m_per_n", 0.0025
+                                )
+                            ),
+                            force_press_cap_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_force_press_cap_m",
+                                    0.00035,
+                                )
+                            ),
+                            ft_ema=float(
+                                a_cfg.get("surface_tip_gmhqp_compc_ft_ema", 0.55)
+                            ),
+                            ft_f_min_n=float(
+                                a_cfg.get("surface_tip_gmhqp_compc_f_min_n", 0.02)
+                            ),
+                            ft_max_lever_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_max_lever_m", 0.08
+                                )
+                            ),
+                            contact_step_cap_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_compc_contact_step_cap_m",
+                                    0.008,
+                                )
+                            ),
+                        )
+                        if tip_gmhqp_compc_enable:
+                            meta["tip_gmhqp_compc_enable"] = True
+                            meta["tip_gmhqp_compc_theory"] = (
+                                "active_extrinsic+letac_mpc_on_gmhqp"
+                            )
+                            if tip_search_pose_hold and use_priv_grasp_a:
+                                meta["tip_gmhqp_compc_pose_hold"] = True
+                        # Track-B Adaptive-C: CouplingEKF online C + uncertainty-weighted C⁺.
+                        tip_gmhqp_ac_enable = bool(
+                            a_cfg.get("surface_tip_gmhqp_ac_enable", False)
+                        ) or bool(_gmhqp_ac_mode)
+                        gmhqp_ac_state = GmhqpAcState()
+                        gmhqp_ac_cfg = GmhqpAcConfig(
+                            k_tip=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_k_tip",
+                                    a_cfg.get("surface_tip_gmhqp_k_tip", 1.4),
+                                )
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_max_step_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_max_step_m",
+                                        a_cfg.get(
+                                            "surface_planned_spiral_max_wrist_step_m",
+                                            0.012,
+                                        ),
+                                    ),
+                                )
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_f_seat_n",
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_contact_n", 0.05
+                                        ),
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_seat_press_m",
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_press_m", 0.00045
+                                        ),
+                                    ),
+                                )
+                            ),
+                            upright_soft_deg=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_upright_soft_deg",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_upright_soft_deg", 16.0
+                                    ),
+                                )
+                            ),
+                            upright_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_upright_step_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_upright_step_m", 0.004
+                                    ),
+                                )
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_mouth_r_m",
+                                    a_cfg.get("surface_tip_gmhqp_mouth_r_m", 0.0045),
+                                )
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_mouth_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_gmhqp_mouth_press_m", 0.0004
+                                    ),
+                                )
+                            ),
+                            c_ridge0=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_c_ridge0", 0.25)
+                            ),
+                            c_ridge_p=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_c_ridge_p", 2.0)
+                            ),
+                            c_ridge_innov=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_c_ridge_innov", 8.0)
+                            ),
+                            c_cond_max=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_c_cond_max", 25.0)
+                            ),
+                            ekf_process_tip=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_ekf_process_tip", 1e-6)
+                            ),
+                            ekf_process_c=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_ekf_process_c", 1e-5)
+                            ),
+                            ekf_meas_var=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_ekf_meas_var", 4e-7)
+                            ),
+                            ekf_slip_ratio=float(
+                                a_cfg.get("surface_tip_gmhqp_ac_ekf_slip_ratio", 0.25)
+                            ),
+                            ekf_slip_dw_m=float(
+                                a_cfg.get(
+                                    "surface_tip_gmhqp_ac_ekf_slip_dw_m", 0.0012
+                                )
+                            ),
+                        )
+                        if tip_gmhqp_ac_enable:
+                            meta["tip_gmhqp_ac_enable"] = True
+                            meta["tip_gmhqp_ac_theory"] = (
+                                "coupling_ekf_adaptive_C+escande_gmhqp"
+                            )
+                            if tip_search_pose_hold and use_priv_grasp_a:
+                                meta["tip_gmhqp_ac_pose_hold"] = True
+                        # Track-B Hybrid GMHQP: tip_task ∨ planar_C ContactMotion fallback.
+                        tip_hybrid_gmhqp_enable = bool(
+                            a_cfg.get("surface_tip_hybrid_gmhqp_enable", False)
+                        ) or bool(_hybrid_gmhqp_mode)
+                        hybrid_gmhqp_cfg = HybridGmhqpConfig(
+                            k_tip=float(
+                                a_cfg.get("surface_tip_hybrid_gmhqp_k_tip", 1.4)
+                            ),
+                            max_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_max_step_m",
+                                    a_cfg.get(
+                                        "surface_planned_spiral_max_wrist_step_m",
+                                        0.012,
+                                    ),
+                                )
+                            ),
+                            f_seat_n=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_f_seat_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            seat_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_seat_press_m",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_press_m", 0.00045
+                                    ),
+                                )
+                            ),
+                            upright_soft_deg=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_upright_soft_deg", 16.0
+                                )
+                            ),
+                            upright_step_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_upright_step_m", 0.004
+                                )
+                            ),
+                            mouth_r_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_mouth_r_m", 0.0045
+                                )
+                            ),
+                            mouth_press_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_mouth_press_m", 0.0004
+                                )
+                            ),
+                            c_ridge=float(
+                                a_cfg.get("surface_tip_hybrid_gmhqp_c_ridge", 0.35)
+                            ),
+                            c_ema=float(
+                                a_cfg.get("surface_tip_hybrid_gmhqp_c_ema", 0.85)
+                            ),
+                            k_path=float(
+                                a_cfg.get("surface_tip_hybrid_gmhqp_k_path", 1.6)
+                            ),
+                            sat_err_m=float(
+                                a_cfg.get("surface_tip_hybrid_gmhqp_sat_err_m", 0.008)
+                            ),
+                            sat_progress_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_sat_progress_m", 0.0005
+                                )
+                            ),
+                            sat_frames=int(
+                                a_cfg.get("surface_tip_hybrid_gmhqp_sat_frames", 40)
+                            ),
+                            recover_err_m=float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_gmhqp_recover_err_m", 0.0055
+                                )
+                            ),
+                        )
+                        if tip_hybrid_gmhqp_enable:
+                            meta["tip_hybrid_gmhqp_enable"] = True
+                            meta["tip_hybrid_gmhqp_theory"] = (
+                                "escande_hybrid_tip_task+planar_C_ContactMotion"
+                            )
+                            if tip_search_pose_hold and use_priv_grasp_a:
+                                meta["tip_hybrid_gmhqp_pose_hold"] = True
+                        # Deployable mouth force-enter after tip reaches mouth ring
+                        # (planner r + F/T); yields spiral → SEAT + mouth_probe.
+                        deploy_mouth_enter = bool(
+                            a_cfg.get("surface_deploy_mouth_enter", False)
+                        )
+                        tip_star_counts = {
+                            "spiral_track": 0,
+                            "local_recover": 0,
+                            "grasp_restore": 0,
+                            "yield_mouth": 0,
+                        }
+                        along_seat_ref_m = float(feat_sp0.along_m)
+                        force_hole_state = SpiralForceHoleDetectState()
+                        search_cfg_sp = cfg.get("compliant", {}).get("search", {})
+                        priv_overforce_streak = 0
+                        priv_overforce_streak_peak = 0
+                        priv_along_drift_peak_m = 0.0
+                        overload_cooldown_sp = 0
+                        last_lat_improve_sp = 0
+                        stuck_count_sp = 0
+                        micro_lift_left = 0
+                        tip_prev_stuck = tip_sp0.copy()
+                        micro_lift_count = 0
+                        lost_contact_count = 0
+                        recontact_left = 0
+                        recontact_count = 0
+                        surface_depth0 = float(np.dot(tip_sp0, spiral_n))
+                        if search_mode == "planned_spiral":
+                            along_hold_m = surface_depth0
+                        if search_mode == "planned_spiral":
+                            # Surface approach: pull tip toward hole in the contact
+                            # plane BEFORE spiraling. Bleed/const-force often leave
+                            # tip 40–80mm out (ep02/10); a long spiral then loses tip.
+                            approach_lat = float(
+                                a_cfg.get("surface_planned_approach_lat_m", 0.022)
+                            )
+                            approach_n = int(
+                                a_cfg.get("surface_planned_approach_frames", 360)
+                            )
+                            approach_step = float(
+                                a_cfg.get("surface_planned_approach_step_m", 0.005)
+                            )
+                            approach_press = float(
+                                a_cfg.get(
+                                    "surface_planned_probe_press_m", 0.00008
+                                )
+                            )
+                            ap_used = 0
+                            feat_ap = features_from_raw(raw)
+                            while (
+                                float(feat_ap.lateral_m) > approach_lat
+                                and ap_used < approach_n
+                            ):
+                                tip_ap = np.asarray(
+                                    feat_ap.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                ctr_ap = _hole_axis_point_at_tip(
+                                    tip_ap,
+                                    feat_ap.socket_pos,
+                                    feat_ap.hole_axis,
+                                )
+                                err_ap = ctr_ap - tip_ap
+                                err_ap = err_ap - spiral_n * float(
+                                    np.dot(err_ap, spiral_n)
+                                )
+                                en_ap = float(np.linalg.norm(err_ap))
+                                if en_ap < 1e-5:
+                                    break
+                                d_ap = err_ap * min(1.0, approach_step / en_ap)
+                                contact_ap = float(_wrist_contact()[0])
+                                # Always reseat while approaching — ep03/07 floated
+                                # at along~140mm with grasp residual, not tray seat.
+                                if contact_ap < 0.05 or float(
+                                    feat_ap.tip_socket_dist_m
+                                ) > 0.115:
+                                    ax_ap = press_ax_spiral * max(
+                                        approach_press * 2.5, 0.0002
+                                    )
+                                else:
+                                    ax_ap = press_ax_spiral * approach_press
+                                site_ap = actual_action44_from_sites(raw)
+                                cmd_ap = np.zeros(44, dtype=np.float64)
+                                cmd_ap[0:6] = site_ap[0:6].copy()
+                                cmd_ap[0:3] = site_ap[0:3] + d_ap + ax_ap
+                                _fill_tip_search_hands(cmd_ap)
+                                cmd_ap[22:28] = site_ap[22:28].copy()
+                                step_action44(
+                                    gym_env, cmd_ap, ego_recorder=ego_recorder
+                                )
+                                ap_used += 1
+                                steps += 1
+                                feat_ap = features_from_raw(raw)
+                                if ap_used == 1 or ap_used % 40 == 0:
+                                    print(
+                                        f"pci: surface-approach j={ap_used} "
+                                        f"lat={feat_ap.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_ap.along_m*1e3:.1f}mm "
+                                        f"|r|={_wrist_contact()[0]:.2f}N",
+                                        flush=True,
+                                    )
+                            if ap_used > 0:
+                                feat_sp0 = features_from_raw(raw)
+                                tip_sp0 = np.asarray(
+                                    feat_sp0.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                along0_spiral = float(feat_sp0.along_m)
+                                surface_depth0 = float(np.dot(tip_sp0, spiral_n))
+                                along_hold_m = surface_depth0
+                                tip_prev_stuck = tip_sp0.copy()
+                                site_sp = actual_action44_from_sites(raw)
+                                print(
+                                    f"pci: surface-approach done frames={ap_used} "
+                                    f"lat={feat_sp0.lateral_m*1e3:.1f}mm "
+                                    f"(then planned spiral)",
+                                    flush=True,
+                                )
+                            # Enough steps to shrink from current tip lat to mouth.
+                            lat_guess = max(
+                                float(feat_sp0.lateral_m),
+                                float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            tip_sp0,
+                                            _hole_axis_point_at_tip(
+                                                tip_sp0,
+                                                feat_sp0.socket_pos,
+                                                feat_sp0.hole_axis,
+                                            ),
+                                            spiral_n,
+                                        )
+                                    )
+                                ),
+                            )
+                            need = int(
+                                max(240, (lat_guess - mouth_lat) / max(pitch, 1e-6)
+                                    * (2.0 * np.pi) / max(dtheta, 1e-4) + 80)
+                            )
+                            planned_wps, planned_rs, planned_ths, planned_center, _basis = (
+                                _plan_surface_enter_spiral(
+                                    tip_sp0,
+                                    feat_sp0.socket_pos,
+                                    feat_sp0.hole_axis,
+                                    spiral_n,
+                                    pitch_m=pitch,
+                                    dtheta=dtheta,
+                                    r_min_m=max(r_min, mouth_lat),
+                                    n_max=max(n_search, need),
+                                )
+                            )
+                            spiral_center = planned_center
+                            spiral_center_mode = "planned_hole"
+                            n_wp = int(planned_wps.shape[0])
+                            n_search = n_wp
+                            # Tip-gated: 1 frame ≠ 1 waypoint; expand budget so tip
+                            # can catch before radius shrinks away (ep01/03 lag).
+                            tip_gate = int(
+                                a_cfg.get(
+                                    "surface_planned_spiral_soft_advance_miss",
+                                    25,
+                                )
+                            ) <= 0 or (
+                                float(
+                                    a_cfg.get(
+                                        "surface_planned_probe_press_m", 0.0
+                                    )
+                                )
+                                > 1e-9
+                                and int(
+                                    a_cfg.get(
+                                        "surface_planned_probe_soft_advance_miss",
+                                        0,
+                                    )
+                                )
+                                <= 0
+                            )
+                            if tip_gate:
+                                fpp = int(
+                                    a_cfg.get(
+                                        "surface_planned_tip_gate_frames_per_wp",
+                                        8,
+                                    )
+                                )
+                                n_search = max(n_wp, n_wp * max(1, fpp))
+                            t1 = _basis[0]
+                            t2 = _basis[1]
+                            print(
+                                f"pci: planned-spiral N_wp={n_wp} "
+                                f"n_frames={n_search} tip_gate={int(tip_gate)} "
+                                f"r0={float(planned_rs[0])*1e3:.1f}mm "
+                                f"rN={float(planned_rs[-1])*1e3:.1f}mm "
+                                f"mouth={mouth_lat*1e3:.1f}mm "
+                                f"(privileged surface→hole FF)",
+                                flush=True,
+                            )
                         stick_active = False
                         stick_count = 0
                         stick_streak = 0
@@ -2784,6 +5409,7 @@ def run_pbvs_biased_surface_press(
                         stick_lat_enter = 0.0
                         stick_along0: float | None = None
                         stick_reached_mouth = False
+                        stick_hop_count = 0
                         stick_lat_best = 1e9
                         stick_stall = 0
                         mouth_wiggle_enable = bool(
@@ -2860,6 +5486,15 @@ def run_pbvs_biased_surface_press(
                                 f"pre_lat={pre_lat_n} (firm grasp)",
                                 flush=True,
                             )
+                        elif search_mode == "planned_spiral":
+                            print(
+                                f"pci: planned-spiral+force f_des={f_des:.2f}N "
+                                f"frames={n_search} track={track:.2f} "
+                                f"lat0={feat_sp0.lateral_m*1e3:.1f}mm "
+                                f"center={spiral_center_mode} "
+                                f"(privileged FF tip track)",
+                                flush=True,
+                            )
                         else:
                             print(
                                 f"pci: tip-spiral+force f_des={f_des:.2f}N frames={n_sp} "
@@ -2869,6 +5504,21 @@ def run_pbvs_biased_surface_press(
                                 f"center={spiral_center_mode} dir={spiral_dir} "
                                 f"shrink={int(lat_shrink_only)} pre_lat={pre_lat_n} "
                                 f"(firm grasp)",
+                                flush=True,
+                            )
+                        f_des_spiral = float(f_des)
+                        if search_mode == "planned_spiral":
+                            c0, _, _, _ = _wrist_contact()
+                            f_des_spiral = min(
+                                float(f_des),
+                                max(
+                                    0.012,
+                                    float(c0) * 1.1 + 0.004,
+                                ),
+                            )
+                            print(
+                                f"pci: planned-spiral f_des cap "
+                                f"{f_des_spiral:.3f}N (contact0={c0:.3f}N)",
                                 flush=True,
                             )
                         if pre_lat_n > 0:
@@ -2932,9 +5582,8 @@ def run_pbvs_biased_surface_press(
                                 cmd = np.zeros(44, dtype=np.float64)
                                 cmd[0:6] = site_now[0:6].copy()
                                 cmd[0:3] = hold_r
-                                cmd[6:22] = hold_r_hand
+                                _fill_tip_search_hands(cmd)
                                 cmd[22:28] = hold_l
-                                cmd[28:44] = hold_l_hand
                                 step_action44(
                                     gym_env, cmd, ego_recorder=ego_recorder
                                 )
@@ -2976,7 +5625,7 @@ def run_pbvs_biased_surface_press(
                                 feat_sp0.tip_pos, dtype=np.float64
                             ).reshape(3)
                             off0_xy = _tip_lat_offset_xy(
-                                tip_sp0, spiral_center, feat_sp0.hole_axis
+                                tip_sp0, spiral_center, spiral_n
                             )
                             r_start = float(np.linalg.norm(off0_xy))
                             theta_sp = (
@@ -2998,21 +5647,316 @@ def run_pbvs_biased_surface_press(
                                     lis_ay0 = lis_ax0 * lis_ay_ratio
                         used_sp = 0
                         r_cmd = 0.0
+                        _bl_meta: dict = {}
                         for used_sp in range(1, max(0, n_search) + 1):
                             feat_i = features_from_raw(raw)
                             site_now = actual_action44_from_sites(raw)
                             tip = np.asarray(feat_i.tip_pos, dtype=np.float64).reshape(3)
+                            tip_gt = tip
+                            tip_ctrl = tip
+                            tip_ctrl_lat_m = float(feat_i.lateral_m)
+                            if tip_theory_ekf is not None and tip_contact_sensor is not None:
+                                _n_est = spiral_n
+                                _hu_est = np.asarray(
+                                    feat_i.hole_axis, dtype=np.float64
+                                ).reshape(3)
+                                _hn_est = float(np.linalg.norm(_hu_est))
+                                if _hn_est > 1e-12:
+                                    _n_est = _hu_est / _hn_est
+                                _w_now = np.asarray(
+                                    site_now[0:3], dtype=np.float64
+                                ).reshape(3)
+                                if tip_axis_enable and isinstance(
+                                    tip_theory_ekf, ExtrinsicTipAxisEKF
+                                ):
+                                    _cen, _fsum, _ncon, _n_c = (
+                                        tip_contact_sensor.measure_peg_tray_tip_ext(
+                                            raw, _n_est
+                                        )
+                                    )
+                                else:
+                                    _cen, _fsum, _ncon = (
+                                        tip_contact_sensor.measure_peg_tray_tip(
+                                            raw, _n_est
+                                        )
+                                    )
+                                    _n_c = None
+                                # Intermittent contact only; absence ≠ negative seat.
+                                _contact_tip = (
+                                    _cen if (_cen is not None and _ncon > 0) else None
+                                )
+                                _wr = read_wrist_wrench_world(raw)
+                                _force = np.asarray(
+                                    _wr[0][:3], dtype=np.float64
+                                ).reshape(3)
+                                _torque = np.asarray(
+                                    _wr[0][3:6], dtype=np.float64
+                                ).reshape(3)
+                                if tip_axis_enable and isinstance(
+                                    tip_theory_ekf, ExtrinsicTipAxisEKF
+                                ):
+                                    _est = tip_theory_ekf.step(
+                                        wrist_pos=_w_now,
+                                        plane_n=_n_est,
+                                        force_xyz=_force,
+                                        torque_xyz=_torque,
+                                        contact_tip=_contact_tip,
+                                        contact_force_n=float(_fsum),
+                                        contact_n=int(_ncon),
+                                        contact_normal=_n_c,
+                                        finger_grasp=tip_contact_sensor.finger_grasp_centroid(
+                                            raw
+                                        ),
+                                        wrist_rot=_right_wrist_site_pose(raw)[1],
+                                        wrist_approach=_wrist_approach_axis(raw),
+                                        tip_gt=tip_gt,  # logging only
+                                        axis_gt=feat_i.peg_axis,  # logging only
+                                    )
+                                    tip_axis_hat = np.asarray(
+                                        _est.axis_hat, dtype=np.float64
+                                    ).reshape(3)
+                                    if np.isfinite(_est.axis_err_to_gt_rad):
+                                        tip_axis_err_peak_rad = max(
+                                            tip_axis_err_peak_rad,
+                                            float(_est.axis_err_to_gt_rad),
+                                        )
+                                else:
+                                    _est = tip_theory_ekf.step(
+                                        wrist_pos=_w_now,
+                                        plane_n=_n_est,
+                                        force_xyz=_force,
+                                        torque_xyz=_torque,
+                                        contact_tip=_contact_tip,
+                                        contact_force_n=float(_fsum),
+                                        contact_n=int(_ncon),
+                                        tip_gt=tip_gt,  # logging only
+                                        # PoseDiff soft prior: same in-hand geom tip
+                                        # GMHQP already uses (tactile/object-pose surrogate).
+                                        geom_tip=tip_gt,
+                                    )
+                                tip_est_wrist_prev = _w_now.copy()
+                                tip_ctrl = np.asarray(
+                                    _est.tip_hat, dtype=np.float64
+                                ).reshape(3)
+                                # TEC joint: feed ˆt into GMHQP only when estimable.
+                                if tip_tec_joint and isinstance(
+                                    tip_theory_ekf, ExtrinsicTipStateEKF
+                                ):
+                                    tip_ctrl, tec_joint_state = select_tip_for_gmhqp(
+                                        tip_hat=tip_ctrl,
+                                        tip_geom=tip_gt,
+                                        plane_n=_n_est,
+                                        est=_est,
+                                        ekf=tip_theory_ekf,
+                                        joint_cfg=tec_joint_cfg,
+                                        state=tec_joint_state,
+                                    )
+                                    tip_est_last_source = (
+                                        f"{_est.source}|tec_{tec_joint_state.last_reason}"
+                                    )
+                                else:
+                                    tip_est_last_source = str(_est.source)
+                                if tip_tec_joint:
+                                    pass  # tip_est_last_source set above
+                                elif False:
+                                    tip_est_last_source = str(_est.source)
+                                if np.isfinite(_est.uncert_m):
+                                    tip_est_uncert_peak_m = max(
+                                        tip_est_uncert_peak_m, float(_est.uncert_m)
+                                    )
+                                if np.isfinite(_est.tip_err_to_gt_m):
+                                    tip_est_err_peak_m = max(
+                                        tip_est_err_peak_m, float(_est.tip_err_to_gt_m)
+                                    )
+                                    tip_est_err_sum_m += float(_est.tip_err_to_gt_m)
+                                    tip_est_err_n += 1
+                                    if bool(_est.seated):
+                                        tip_est_seated_frames += 1
+                                _mouth_est = _hole_axis_point_at_tip(
+                                    tip_ctrl,
+                                    feat_i.socket_pos,
+                                    _n_est,
+                                )
+                                tip_ctrl_lat_m = float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            tip_ctrl, _mouth_est, _n_est
+                                        )
+                                    )
+                                )
+                            elif tip_est_enable and tip_est is not None:
+                                _n_est = spiral_n
+                                _hu_est = np.asarray(
+                                    feat_i.hole_axis, dtype=np.float64
+                                ).reshape(3)
+                                _hn_est = float(np.linalg.norm(_hu_est))
+                                if _hn_est > 1e-12:
+                                    _n_est = _hu_est / _hn_est
+                                _w_now = np.asarray(
+                                    site_now[0:3], dtype=np.float64
+                                ).reshape(3)
+                                _w_delta = None
+                                if tip_est_wrist_prev is not None:
+                                    _w_delta = _w_now - tip_est_wrist_prev
+                                _est = tip_est.update(
+                                    raw,
+                                    wrist_pos=_w_now,
+                                    plane_n=_n_est,
+                                    tip_gt=tip_gt,  # logging only
+                                    wrist_delta=_w_delta,
+                                )
+                                tip_est_wrist_prev = _w_now.copy()
+                                tip_ctrl = np.asarray(
+                                    _est.tip_hat, dtype=np.float64
+                                ).reshape(3)
+                                tip_est_last_source = str(_est.source)
+                                if np.isfinite(_est.tip_err_to_gt_m):
+                                    tip_est_err_peak_m = max(
+                                        tip_est_err_peak_m, float(_est.tip_err_to_gt_m)
+                                    )
+                                    tip_est_err_sum_m += float(_est.tip_err_to_gt_m)
+                                    tip_est_err_n += 1
+                                    if bool(_est.seated):
+                                        tip_est_seated_frames += 1
+                                _mouth_est = _hole_axis_point_at_tip(
+                                    tip_ctrl,
+                                    feat_i.socket_pos,
+                                    _n_est,
+                                )
+                                tip_ctrl_lat_m = float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            tip_ctrl, _mouth_est, _n_est
+                                        )
+                                    )
+                                )
+                            elif tip_obs_enable and tip_obs_rng is not None:
+                                _n_obs = spiral_n
+                                _hu_obs = np.asarray(
+                                    feat_i.hole_axis, dtype=np.float64
+                                ).reshape(3)
+                                _hn_obs = float(np.linalg.norm(_hu_obs))
+                                if _hn_obs > 1e-12:
+                                    _n_obs = _hu_obs / _hn_obs
+                                tip_ctrl, _ = observe_tip_planar(
+                                    tip_gt,
+                                    _n_obs,
+                                    sigma_m=float(tip_obs_sigma_mm) * 1e-3,
+                                    rng=tip_obs_rng,
+                                    lag_buf=tip_obs_lag_buf,
+                                    lag_frames=int(tip_obs_lag_frames),
+                                )
+                                _mouth_obs = _hole_axis_point_at_tip(
+                                    tip_ctrl,
+                                    feat_i.socket_pos,
+                                    _n_obs,
+                                )
+                                tip_ctrl_lat_m = float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            tip_ctrl, _mouth_obs, _n_obs
+                                        )
+                                    )
+                                )
+                            contact_gate_sp = 0.0
+                            if (
+                                search_mode == "planned_spiral" and stick_phase == "search"
+                            ) or franka_faithful:
+                                contact_gate_sp, _, _, _ = _wrist_contact()
+                                # Tilted tray/hole face: refresh contact normal from
+                                # wrist force so planar track stays on the surface.
+                                if search_mode == "planned_spiral" and bool(
+                                    a_cfg.get(
+                                        "surface_planned_update_contact_normal",
+                                        True,
+                                    )
+                                ):
+                                    wr_n = read_wrist_wrench_world(raw)
+                                    f_n = np.asarray(
+                                        wr_n[0][:3], dtype=np.float64
+                                    ).reshape(3)
+                                    fn = float(np.linalg.norm(f_n))
+                                    fmin = float(
+                                        a_cfg.get(
+                                            "surface_tip_spiral_contact_fmin_n",
+                                            0.03,
+                                        )
+                                    )
+                                    if fn >= fmin:
+                                        n_new = f_n / (fn + 1e-12)
+                                        hole_u_now = feat_i.hole_axis / (
+                                            np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                        )
+                                        if float(n_new @ hole_u_now) < 0.0:
+                                            n_new = -n_new
+                                        blend = float(
+                                            a_cfg.get(
+                                                "surface_planned_normal_blend",
+                                                0.15,
+                                            )
+                                        )
+                                        spiral_n = spiral_n + blend * (
+                                            n_new - spiral_n
+                                        )
+                                        spiral_n = spiral_n / (
+                                            np.linalg.norm(spiral_n) + 1e-12
+                                        )
+                                        t1, t2, spiral_n = hole_task_basis(spiral_n)
+                                        press_ax_spiral = -spiral_n
+                            if (
+                                stick_enable
+                                and stick_hop_probe
+                                and search_mode in _priv_lat_modes
+                                and stick_phase == "search"
+                                and used_sp == 1
+                            ):
+                                # User-requested probe: hop-contact-hop from first search step.
+                                stick_phase = "lift"
+                                stick_phase_i = 0
+                                stick_active = True
+                                stick_along0 = float(feat_i.along_m)
+                                stick_lat_enter = float(feat_i.lateral_m)
+                                stick_lat_best = float(feat_i.lateral_m)
+                                stick_stall = 0
+                                print(
+                                    f"pci: hop-probe start lat={stick_lat_enter*1e3:.1f}mm "
+                                    f"along={stick_along0*1e3:.1f}mm "
+                                    f"hop={stick_slide_step*1e3:.1f}mm",
+                                    flush=True,
+                                )
                             ax_i = feat_i.hole_axis / (
                                 np.linalg.norm(feat_i.hole_axis) + 1e-12
                             )
-                            theta_sp = theta_sp + dtheta
+                            # Tip surface spiral: rotate/press about contact normal.
+                            if (
+                                spiral_along_hold
+                                and search_mode in ("spiral", "planned_spiral")
+                                and stick_phase == "search"
+                            ):
+                                ax_i = spiral_n
+                            # Do not spin farther while tip has already drifted outside
+                            # the commanded radius (that made lat only grow away).
+                            tip_r_gate = float(
+                                np.linalg.norm(
+                                    _tip_lat_offset_xy(tip, spiral_center, ax_i)
+                                )
+                            )
+                            spiral_track_gate = bool(
+                                spiral_along_hold
+                                and search_mode in ("spiral", "planned_spiral")
+                                and stick_phase == "search"
+                            )
+                            if (not spiral_track_gate) or tip_r_gate <= max(
+                                float(r_cmd) + 0.003, 0.004
+                            ):
+                                theta_sp = theta_sp + dtheta
                             turn = theta_sp / (2.0 * np.pi)
                             center_i = _hole_axis_point_at_tip(
                                 tip, feat_i.socket_pos, feat_i.hole_axis
                             )
                             ax_j = 0.0
                             ay_j = 0.0
-                            f_des_step = float(f_des)
+                            f_des_step = float(f_des_spiral)
                             stick_active = False
                             d_stick = np.zeros(3, dtype=np.float64)
                             if search_mode in _priv_lat_modes:
@@ -3113,6 +6057,920 @@ def run_pbvs_biased_surface_press(
                                         )
                                     )
                                 )
+                            elif search_mode == "planned_spiral":
+                                assert planned_wps is not None and planned_rs is not None
+                                # Strong tip FB to current waypoint; advance on planar catch.
+                                catch = float(
+                                    a_cfg.get("surface_planned_spiral_catch_m", 0.005)
+                                )
+                                if float(
+                                    a_cfg.get("surface_planned_probe_press_m", 0.0)
+                                ) > 1e-9:
+                                    catch = max(
+                                        catch,
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_probe_catch_m",
+                                                0.0035,
+                                            )
+                                        ),
+                                    )
+                                max_adv = int(
+                                    a_cfg.get("surface_planned_spiral_max_advance", 3)
+                                )
+                                soft_miss = int(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_soft_advance_miss",
+                                        25,
+                                    )
+                                )
+                                # Tip-gated advance: wait until tip catches the waypoint.
+                                # Open-loop soft_advance=1 made ep01/03 tip lag 20–50mm
+                                # while radius shrank to mouth. Default probe miss=0.
+                                if (
+                                    soft_miss <= 0
+                                    and float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.0
+                                        )
+                                    )
+                                    > 1e-9
+                                ):
+                                    soft_miss = int(
+                                        a_cfg.get(
+                                            "surface_planned_probe_soft_advance_miss",
+                                            0,
+                                        )
+                                    )
+                                seat_frames = int(
+                                    a_cfg.get(
+                                        "surface_planned_force_seat_frames", 0
+                                    )
+                                )
+                                planar_gate_n = float(
+                                    a_cfg.get(
+                                        "surface_planned_planar_force_gate_n",
+                                        0.052,
+                                    )
+                                )
+                                force_seat_sp = (
+                                    seat_frames > 0 and used_sp <= seat_frames
+                                )
+                                freeze_path = force_seat_sp or (
+                                    contact_gate_sp
+                                    > planar_gate_n
+                                )
+                                # Probe spiral: never freeze radius advance on mild
+                                # overload — that froze ep01 at r≈14.6mm while tip fled.
+                                # Overload still slows planar track via force_gate.
+                                if (
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.0
+                                        )
+                                    )
+                                    > 1e-9
+                                    and bool(
+                                        a_cfg.get(
+                                            "surface_planned_probe_no_freeze_path",
+                                            True,
+                                        )
+                                    )
+                                ):
+                                    freeze_path = bool(force_seat_sp)
+                                soft_miss_use = 0 if freeze_path else soft_miss
+                                # Optional stiction scrub (default off): open-loop
+                                # advance under high resid made ep01 tip lag 20mm+.
+                                if (
+                                    soft_miss_use <= 0
+                                    and float(contact_gate_sp) > planar_gate_n
+                                    and float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.0
+                                        )
+                                    )
+                                    > 1e-9
+                                ):
+                                    soft_miss_use = int(
+                                        a_cfg.get(
+                                            "surface_planned_stiction_soft_advance_miss",
+                                            0,
+                                        )
+                                    )
+                                advanced = False
+                                hyb_allow_adv = (not tip_hybrid_enable) or (
+                                    tip_hybrid_state.mode == "spiral"
+                                )
+                                # Tip-MSAR Type B: freeze radius while reseating after slip.
+                                if tip_msar_enable and int(
+                                    tip_hybrid_state.slip_reseat_left
+                                ) > 0:
+                                    hyb_allow_adv = False
+                                    tip_hybrid_state.slip_reseat_left = max(
+                                        0, int(tip_hybrid_state.slip_reseat_left) - 1
+                                    )
+                                # Tip-STAR / Type-B: freeze while grasp-restore / local-recover.
+                                if tip_slip_enable and int(
+                                    tip_hybrid_state.star_reseat_left
+                                ) > 0:
+                                    hyb_allow_adv = False
+                                    tip_hybrid_state.star_reseat_left = max(
+                                        0, int(tip_hybrid_state.star_reseat_left) - 1
+                                    )
+                                    if tip_hybrid_state.star_reseat_left == 0 and (
+                                        tip_hybrid_state.star_mode == "grasp_restore"
+                                    ):
+                                        tip_hybrid_state.star_mode = "spiral_track"
+                                        print(
+                                            "pci: Type-B GRASP_RESTORE done → resume spiral",
+                                            flush=True,
+                                        )
+                                # Agent-D oracle v2: freeze planar while reseat+tighten.
+                                if tip_oracle_enable and int(
+                                    tip_hybrid_state.oracle_reseat_left
+                                ) > 0:
+                                    hyb_allow_adv = False
+                                    tip_hybrid_state.oracle_reseat_left = max(
+                                        0, int(tip_hybrid_state.oracle_reseat_left) - 1
+                                    )
+                                    if tip_hybrid_state.oracle_reseat_left == 0:
+                                        print(
+                                            "pci: ORACLE slip-reseat done → resume tip→mouth",
+                                            flush=True,
+                                        )
+                                # Agent-R: EKF slip / large tip lag → freeze radius advance
+                                # until tip catches (Type B).
+                                if (
+                                    tip_coupling_ekf is not None
+                                    and tip_baseline_mode in ("ekf_qp", "s9")
+                                    and bool(
+                                        a_cfg.get(
+                                            "surface_tip_ekf_freeze_adv_on_slip",
+                                            True,
+                                        )
+                                    )
+                                ):
+                                    tip_err_mm = 0.0
+                                    if planned_wps is not None:
+                                        e_lag = planned_wps[planned_i] - tip
+                                        e_lag = e_lag - spiral_n * float(
+                                            np.dot(e_lag, spiral_n)
+                                        )
+                                        tip_err_mm = float(np.linalg.norm(e_lag)) * 1e3
+                                    err_freeze = float(
+                                        a_cfg.get(
+                                            "surface_tip_ekf_freeze_tip_err_mm",
+                                            8.0,
+                                        )
+                                    )
+                                    if bool(tip_coupling_ekf.just_slipped) or (
+                                        tip_err_mm > err_freeze
+                                    ):
+                                        hyb_allow_adv = False
+                                if tip_msar_enable and planned_wps is not None:
+                                    e_ms = planned_wps[planned_i] - tip
+                                    e_ms = e_ms - spiral_n * float(
+                                        np.dot(e_ms, spiral_n)
+                                    )
+                                    if tip_msar_slip_trip(
+                                        grasp_slip_m=float(grasp_slip_peak),
+                                        tip_err_m=float(np.linalg.norm(e_ms)),
+                                        slip_tau_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_msar_slip_tau_m", 0.08
+                                            )
+                                        ),
+                                        tip_err_tau_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_msar_tip_err_tau_m",
+                                                0.012,
+                                            )
+                                        ),
+                                    ):
+                                        hyb_allow_adv = False
+                                        tip_hybrid_state.msar_mode = "slip_reseat"
+                                        tip_hybrid_state.slip_reseat_left = max(
+                                            int(tip_hybrid_state.slip_reseat_left),
+                                            int(
+                                                a_cfg.get(
+                                                    "surface_tip_msar_reseat_frames",
+                                                    25,
+                                                )
+                                            ),
+                                        )
+                                        if tip_planar_coupling_est is not None:
+                                            tip_planar_coupling_est._slip_reset()
+                                        if tip_coupling_ekf is not None:
+                                            tip_coupling_ekf.slip_reset()
+                                if tip_slip_enable and planned_wps is not None:
+                                    e_st = planned_wps[planned_i] - tip
+                                    e_st = e_st - spiral_n * float(
+                                        np.dot(e_st, spiral_n)
+                                    )
+                                    tip_off_st = _tip_lat_offset_xy(
+                                        tip, spiral_center, spiral_n
+                                    )
+                                    tip_rho_st = float(np.linalg.norm(tip_off_st))
+                                    r_cmd_st = float(planned_rs[planned_i])
+                                    tip_err_st = float(np.linalg.norm(e_st))
+                                    slip_tau = float(
+                                        a_cfg.get(
+                                            "surface_tip_slip_tau_m",
+                                            a_cfg.get(
+                                                "surface_tip_star_slip_tau_m", 0.12
+                                            ),
+                                        )
+                                    )
+                                    slip_tip_err = float(
+                                        a_cfg.get(
+                                            "surface_tip_slip_tip_err_m",
+                                            a_cfg.get(
+                                                "surface_tip_star_slip_tip_err_m",
+                                                0.020,
+                                            ),
+                                        )
+                                    )
+                                    slip_lag = float(
+                                        a_cfg.get(
+                                            "surface_tip_slip_lag_margin_m",
+                                            a_cfg.get(
+                                                "surface_tip_star_lag_margin_m",
+                                                0.003,
+                                            ),
+                                        )
+                                    )
+                                    trip_st = tip_star_slip_trip(
+                                        grasp_slip_m=float(grasp_slip_peak),
+                                        tip_err_m=tip_err_st,
+                                        r_cmd_m=r_cmd_st,
+                                        tip_rho_m=tip_rho_st,
+                                        slip_tau_m=slip_tau,
+                                        tip_err_tau_m=slip_tip_err,
+                                        lag_margin_m=slip_lag,
+                                        spiral_direction=str(spiral_dir),
+                                        # Latch lives in tip_slip_can_enter_restore;
+                                        # do not double-filter here.
+                                        slip_armed_m=-1.0,
+                                    )
+                                    already = (
+                                        tip_hybrid_state.star_mode == "grasp_restore"
+                                        or int(tip_hybrid_state.star_reseat_left) > 0
+                                    )
+                                    if tip_slip_can_enter_restore(
+                                        trip=trip_st,
+                                        already_restoring=already,
+                                        last_trip_slip_m=float(
+                                            tip_hybrid_state.star_slip_armed_m
+                                        ),
+                                        slip_now_m=float(grasp_slip_peak),
+                                        retrip_delta_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_slip_retrip_delta_m",
+                                                a_cfg.get(
+                                                    "surface_tip_star_retrip_delta_m",
+                                                    0.05,
+                                                ),
+                                            )
+                                        ),
+                                    ):
+                                        hyb_allow_adv = False
+                                        tip_hybrid_state.star_mode = "grasp_restore"
+                                        tip_hybrid_state.star_slip_armed_m = float(
+                                            grasp_slip_peak
+                                        )
+                                        tip_hybrid_state.star_reseat_left = max(
+                                            int(tip_hybrid_state.star_reseat_left),
+                                            int(
+                                                a_cfg.get(
+                                                    "surface_tip_slip_reseat_frames",
+                                                    a_cfg.get(
+                                                        "surface_tip_star_reseat_frames",
+                                                        30,
+                                                    ),
+                                                )
+                                            ),
+                                        )
+                                        # Reseat SEAT: freeze planar advance + hybrid SEAT.
+                                        if bool(
+                                            a_cfg.get(
+                                                "surface_tip_slip_force_seat",
+                                                a_cfg.get(
+                                                    "surface_tip_star_force_seat",
+                                                    True,
+                                                ),
+                                            )
+                                        ):
+                                            tip_hybrid_state.mode = "seat"
+                                            tip_hybrid_state.seat_ok_streak = 0
+                                            tip_hybrid_state.upright_ok_streak = 0
+                                        if tip_planar_coupling_est is not None:
+                                            tip_planar_coupling_est._slip_reset()
+                                        if tip_coupling_ekf is not None:
+                                            tip_coupling_ekf.slip_reset()
+                                        # Real grasp tighten — must bypass handoff freeze.
+                                        boost = float(
+                                            a_cfg.get(
+                                                "surface_tip_slip_grasp_scale",
+                                                a_cfg.get(
+                                                    "surface_tip_star_grasp_scale",
+                                                    1.45,
+                                                ),
+                                            )
+                                        )
+                                        bypass = bool(
+                                            a_cfg.get(
+                                                "surface_tip_slip_grasp_bypass_freeze",
+                                                a_cfg.get(
+                                                    "surface_tip_star_grasp_bypass_freeze",
+                                                    True,
+                                                ),
+                                            )
+                                        )
+                                        tight = _tighten_left_grasp(
+                                            max(float(grasp_ramp_scale), boost),
+                                            bypass_freeze=bypass,
+                                        )
+                                        tip_hybrid_state.star_grasp_boosted = bool(
+                                            tip_hybrid_state.star_grasp_boosted
+                                            or tight.get("ok")
+                                        )
+                                        if bool(tight.get("ok")):
+                                            tip_hybrid_state.star_grasp_mean_abs_before = (
+                                                float(tight.get("mean_abs_before", 0.0))
+                                            )
+                                            tip_hybrid_state.star_grasp_mean_abs_after = (
+                                                float(tight.get("mean_abs_after", 0.0))
+                                            )
+                                            meta["tip_slip_grasp_tighten_ok"] = True
+                                            meta["tip_slip_hand_mean_abs_before"] = (
+                                                float(tight.get("mean_abs_before", 0.0))
+                                            )
+                                            meta["tip_slip_hand_mean_abs_after"] = float(
+                                                tight.get("mean_abs_after", 0.0)
+                                            )
+                                        meta["tip_slip_grasp_bypass_freeze"] = bool(
+                                            tight.get("bypassed_freeze")
+                                        )
+                                        meta["tip_slip_grasp_scale"] = float(
+                                            tight.get("scale", boost)
+                                        )
+                                        meta["tip_slip_trips"] = int(
+                                            meta.get("tip_slip_trips", 0)
+                                        ) + 1
+                                        print(
+                                            f"pci: Type-B GRASP_RESTORE trip "
+                                            f"slip={grasp_slip_peak*1e3:.1f}mm "
+                                            f"tighten_ok={bool(tight.get('ok'))} "
+                                            f"mean|q|="
+                                            f"{float(tight.get('mean_abs_before', 0)):.3f}"
+                                            f"→{float(tight.get('mean_abs_after', 0)):.3f}",
+                                            flush=True,
+                                        )
+                                # Agent-D oracle v2: large slip → freeze planar, reseat+tighten,
+                                # then resume tip→mouth (NOT deployable).
+                                if tip_oracle_enable and bool(
+                                    a_cfg.get("surface_tip_oracle_slip_reseat", False)
+                                ):
+                                    trip_or = tip_oracle_slip_trip(
+                                        grasp_slip_m=float(grasp_slip_peak),
+                                        tip_lat_m=float(
+                                            tip_ctrl_lat_m
+                                            if (tip_obs_enable or tip_est_enable)
+                                            else feat_i.lateral_m
+                                        ),
+                                        slip_tau_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_slip_tau_m", 0.035
+                                            )
+                                        ),
+                                        tip_lag_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_tip_lag_m", 0.008
+                                            )
+                                        ),
+                                        mouth_m=float(
+                                            a_cfg.get(
+                                                "surface_spiral_mouth_lat_m", 0.0045
+                                            )
+                                        ),
+                                        slip_armed_m=float(
+                                            tip_hybrid_state.oracle_slip_armed_m
+                                        ),
+                                    )
+                                    already_or = (
+                                        int(tip_hybrid_state.oracle_reseat_left) > 0
+                                    )
+                                    if tip_slip_can_enter_restore(
+                                        trip=trip_or,
+                                        already_restoring=already_or,
+                                        last_trip_slip_m=float(
+                                            tip_hybrid_state.oracle_slip_armed_m
+                                        ),
+                                        slip_now_m=float(grasp_slip_peak),
+                                        retrip_delta_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_retrip_delta_m",
+                                                0.04,
+                                            )
+                                        ),
+                                    ):
+                                        hyb_allow_adv = False
+                                        tip_hybrid_state.oracle_slip_armed_m = float(
+                                            grasp_slip_peak
+                                        )
+                                        tip_hybrid_state.oracle_reseat_left = max(
+                                            int(tip_hybrid_state.oracle_reseat_left),
+                                            int(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_reseat_frames",
+                                                    40,
+                                                )
+                                            ),
+                                        )
+                                        # Soft SEAT cue only if floated; keep mouth PD.
+                                        float_or = max(
+                                            0.0,
+                                            _priv_tip_surface_depth_m(
+                                                tip, tip_sp0, spiral_n
+                                            ),
+                                        )
+                                        if float_or > float(
+                                            a_cfg.get(
+                                                "surface_tip_hybrid_float_tol_m",
+                                                0.0015,
+                                            )
+                                        ):
+                                            tip_hybrid_state.mode = "seat"
+                                            tip_hybrid_state.seat_ok_streak = 0
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                        boost_or = float(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_grasp_scale", 1.55
+                                            )
+                                        )
+                                        tight_or = _tighten_left_grasp(
+                                            max(float(grasp_ramp_scale), boost_or),
+                                            bypass_freeze=bool(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_grasp_bypass_freeze",
+                                                    True,
+                                                )
+                                            ),
+                                        )
+                                        tip_hybrid_state.oracle_grasp_boosted = bool(
+                                            tip_hybrid_state.oracle_grasp_boosted
+                                            or tight_or.get("ok")
+                                        )
+                                        meta["tip_oracle_slip_trips"] = int(
+                                            meta.get("tip_oracle_slip_trips", 0)
+                                        ) + 1
+                                        print(
+                                            f"pci: ORACLE slip-reseat trip "
+                                            f"slip={grasp_slip_peak*1e3:.1f}mm "
+                                            f"lat={feat_i.lateral_m*1e3:.1f}mm "
+                                            f"tighten_ok={bool(tight_or.get('ok'))}",
+                                            flush=True,
+                                        )
+                                # Track-B PHIG: proprio slip + r_cmd/F/T mouth (no tip GT).
+                                if tip_phig_enable and planned_wps is not None:
+                                    r_cmd_ph = float(planned_rs[planned_i])
+                                    axis_deg_ph = float(
+                                        np.degrees(
+                                            float(
+                                                getattr(
+                                                    feat_i, "axis_error_rad", 0.0
+                                                )
+                                            )
+                                        )
+                                    )
+                                    # contact_sp is assigned later in the frame; read now.
+                                    _c_ph, _, _, _ = _wrist_contact()
+                                    prev_phig_mode = str(phig_state.mode)
+                                    prev_phig_reseat = int(phig_state.reseat_left)
+                                    phig_state = phig_select_mode(
+                                        phig_state,
+                                        hybrid_mode=str(tip_hybrid_state.mode),
+                                        r_cmd_m=r_cmd_ph,
+                                        contact_resid_n=float(_c_ph),
+                                        force_hole_cue=bool(force_hole_state.entered),
+                                        grasp_slip_m=float(grasp_slip_peak),
+                                        axis_err_deg=axis_deg_ph,
+                                        cfg=phig_cfg,
+                                    )
+                                    if phig_state.mode in (
+                                        "slip_reseat",
+                                        "mouth_press",
+                                        "enter_hold",
+                                    ):
+                                        hyb_allow_adv = False
+                                    if phig_state.mode == "enter_hold":
+                                        tip_hybrid_state.mode = "upright"
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                    new_slip = (
+                                        phig_state.mode == "slip_reseat"
+                                        and (
+                                            prev_phig_reseat <= 0
+                                            or prev_phig_mode != "slip_reseat"
+                                        )
+                                    )
+                                    if new_slip:
+                                        float_ph = max(
+                                            0.0,
+                                            _priv_tip_surface_depth_m(
+                                                tip, tip_sp0, spiral_n
+                                            ),
+                                        )
+                                        if float_ph > float(
+                                            a_cfg.get(
+                                                "surface_tip_hybrid_float_tol_m",
+                                                0.0015,
+                                            )
+                                        ):
+                                            tip_hybrid_state.mode = "seat"
+                                            tip_hybrid_state.seat_ok_streak = 0
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                        if tip_planar_coupling_est is not None:
+                                            tip_planar_coupling_est._slip_reset()
+                                        if tip_coupling_ekf is not None:
+                                            tip_coupling_ekf.slip_reset()
+                                        boost_ph = float(phig_cfg.grasp_scale)
+                                        tight_ph = _tighten_left_grasp(
+                                            max(float(grasp_ramp_scale), boost_ph),
+                                            bypass_freeze=bool(
+                                                a_cfg.get(
+                                                    "surface_tip_phig_grasp_bypass_freeze",
+                                                    True,
+                                                )
+                                            ),
+                                        )
+                                        phig_state.grasp_boosted = bool(
+                                            phig_state.grasp_boosted
+                                            or tight_ph.get("ok")
+                                        )
+                                        meta["tip_phig_slip_trips"] = int(
+                                            meta.get("tip_phig_slip_trips", 0)
+                                        ) + 1
+                                        meta["tip_phig_grasp_bypass_freeze"] = bool(
+                                            tight_ph.get("bypassed_freeze")
+                                        )
+                                        meta["tip_phig_grasp_scale"] = float(
+                                            tight_ph.get("scale", boost_ph)
+                                        )
+                                        if bool(tight_ph.get("ok")):
+                                            meta["tip_phig_grasp_tighten_ok"] = True
+                                            meta["tip_phig_hand_mean_abs_before"] = (
+                                                float(
+                                                    tight_ph.get(
+                                                        "mean_abs_before", 0.0
+                                                    )
+                                                )
+                                            )
+                                            meta["tip_phig_hand_mean_abs_after"] = (
+                                                float(
+                                                    tight_ph.get(
+                                                        "mean_abs_after", 0.0
+                                                    )
+                                                )
+                                            )
+                                        print(
+                                            f"pci: PHIG slip-reseat trip "
+                                            f"slip={grasp_slip_peak*1e3:.1f}mm "
+                                            f"r_cmd={r_cmd_ph*1e3:.1f}mm "
+                                            f"tighten_ok={bool(tight_ph.get('ok'))}",
+                                            flush=True,
+                                        )
+                                if not force_seat_sp and hyb_allow_adv:
+                                    for _adv in range(max(1, max_adv)):
+                                        target = planned_wps[planned_i].copy()
+                                        e_pl = target - tip
+                                        e_pl = e_pl - spiral_n * float(
+                                            np.dot(e_pl, spiral_n)
+                                        )
+                                        if float(np.linalg.norm(e_pl)) > catch:
+                                            break
+                                        if planned_i + 1 >= planned_wps.shape[0]:
+                                            break
+                                        planned_i += 1
+                                        advanced = True
+                                else:
+                                    target = planned_wps[planned_i].copy()
+                                if advanced:
+                                    catch_miss_sp = 0
+                                else:
+                                    catch_miss_sp += 1
+                                    # Soft-advance only when enabled (>0); else follow path.
+                                    if (
+                                        hyb_allow_adv
+                                        and soft_miss_use > 0
+                                        and catch_miss_sp >= soft_miss_use
+                                        and planned_i + 1 < planned_wps.shape[0]
+                                    ):
+                                        planned_i += 1
+                                        catch_miss_sp = 0
+                                target = planned_wps[planned_i].copy()
+                                r_cmd = float(planned_rs[planned_i])
+                                theta_sp = float(planned_ths[planned_i])
+                                # Tip-MSAR Type A: blend spiral waypoint → mouth attractor.
+                                if tip_msar_enable and tip_hybrid_state.mode == "spiral":
+                                    target, msar_alpha, msar_m = tip_msar_blend_target(
+                                        tip=tip,
+                                        spiral_target=target,
+                                        hole_center=spiral_center,
+                                        normal=spiral_n,
+                                        mouth_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_msar_mouth_m",
+                                                a_cfg.get(
+                                                    "surface_spiral_mouth_lat_m",
+                                                    0.0045,
+                                                ),
+                                            )
+                                        ),
+                                        blend_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_msar_blend_m", 0.012
+                                            )
+                                        ),
+                                    )
+                                    if tip_hybrid_state.msar_mode != "slip_reseat":
+                                        tip_hybrid_state.msar_mode = str(msar_m)
+                                    tip_msar_counts[tip_hybrid_state.msar_mode] = (
+                                        tip_msar_counts.get(
+                                            tip_hybrid_state.msar_mode, 0
+                                        )
+                                        + 1
+                                    )
+                                    # Far from mouth: do not expand spiral further.
+                                    if float(msar_alpha) > 0.35:
+                                        hyb_allow_adv = False
+                                # Tip-STAR: track-saturate local recover (no hole PD).
+                                # Type-B-only (`surface_tip_slip_enable`) counts restore
+                                # frames without enabling Type-A local_recover / yield.
+                                if (
+                                    tip_slip_enable
+                                    and tip_hybrid_state.star_mode == "grasp_restore"
+                                ):
+                                    tip_star_counts["grasp_restore"] = (
+                                        tip_star_counts.get("grasp_restore", 0) + 1
+                                    )
+                                    hyb_allow_adv = False
+                                elif tip_star_enable and tip_hybrid_state.mode == "spiral":
+                                    tip_off_sr = _tip_lat_offset_xy(
+                                        tip, spiral_center, spiral_n
+                                    )
+                                    tip_rho_sr = float(np.linalg.norm(tip_off_sr))
+                                    e_sr = target - tip
+                                    e_sr = e_sr - spiral_n * float(
+                                        np.dot(e_sr, spiral_n)
+                                    )
+                                    tip_err_sr = float(np.linalg.norm(e_sr))
+                                    mouth_sr = float(
+                                        a_cfg.get(
+                                            "surface_tip_star_mouth_m",
+                                            a_cfg.get(
+                                                "surface_spiral_mouth_lat_m",
+                                                0.0045,
+                                            ),
+                                        )
+                                    )
+                                    force_cue = bool(
+                                        force_hole_detect
+                                        and force_hole_state.entered
+                                    )
+                                    if tip_star_yield_mouth(
+                                        r_cmd_m=float(r_cmd),
+                                        tip_rho_m=tip_rho_sr,
+                                        tip_err_m=tip_err_sr,
+                                        mouth_m=mouth_sr,
+                                        tip_err_near_m=float(
+                                            a_cfg.get(
+                                                "surface_tip_star_near_err_m",
+                                                0.008,
+                                            )
+                                        ),
+                                        force_mouth_cue=force_cue,
+                                    ):
+                                        tip_hybrid_state.star_mode = "yield_mouth"
+                                        tip_hybrid_state.star_sat_streak = 0
+                                        tip_star_counts["yield_mouth"] = (
+                                            tip_star_counts.get("yield_mouth", 0) + 1
+                                        )
+                                        hyb_allow_adv = False
+                                        # Keep spiral target; SEAT/mouth-probe own enter.
+                                    else:
+                                        sat = tip_star_track_saturate(
+                                            tip_err_m=tip_err_sr,
+                                            r_cmd_m=float(r_cmd),
+                                            tip_rho_m=tip_rho_sr,
+                                            tip_err_tau_m=float(
+                                                a_cfg.get(
+                                                    "surface_tip_star_sat_err_m",
+                                                    0.010,
+                                                )
+                                            ),
+                                            lag_margin_m=float(
+                                                a_cfg.get(
+                                                    "surface_tip_star_lag_margin_m",
+                                                    0.003,
+                                                )
+                                            ),
+                                            spiral_direction=str(spiral_dir),
+                                        )
+                                        if sat:
+                                            tip_hybrid_state.star_sat_streak = (
+                                                int(tip_hybrid_state.star_sat_streak)
+                                                + 1
+                                            )
+                                        else:
+                                            tip_hybrid_state.star_sat_streak = 0
+                                        n_sat = int(
+                                            a_cfg.get(
+                                                "surface_tip_star_sat_frames", 8
+                                            )
+                                        )
+                                        # STAR ep02 lesson: never planar-recover while
+                                        # axis is soft-bad — Tip-Hybrid UPRIGHT first.
+                                        _, axis_err_sat, _ = _tip_hole_pose_err(
+                                            tip,
+                                            spiral_center,
+                                            feat_i.hole_axis,
+                                            feat_i.peg_axis,
+                                        )
+                                        upright_soft_sat = float(
+                                            np.radians(
+                                                a_cfg.get(
+                                                    "surface_tip_hybrid_upright_soft_deg",
+                                                    18.0,
+                                                )
+                                            )
+                                        )
+                                        axis_blocks_recover = bool(
+                                            a_cfg.get(
+                                                "surface_tip_star_upright_before_recover",
+                                                True,
+                                            )
+                                        ) and float(axis_err_sat) > upright_soft_sat
+                                        if (
+                                            int(tip_hybrid_state.star_sat_streak)
+                                            >= n_sat
+                                            and not axis_blocks_recover
+                                        ):
+                                            tip_hybrid_state.star_mode = "local_recover"
+                                            target = tip_star_local_target(
+                                                tip=tip,
+                                                spiral_target=target,
+                                                spiral_center=spiral_center,
+                                                normal=spiral_n,
+                                                r_cmd_m=float(r_cmd),
+                                                spiral_direction=str(spiral_dir),
+                                                mouth_m=float(mouth_sr),
+                                                shrink_step_m=float(
+                                                    a_cfg.get(
+                                                        "surface_tip_star_recover_shrink_m",
+                                                        0.001,
+                                                    )
+                                                ),
+                                            )
+                                            hyb_allow_adv = False
+                                            tip_star_counts["local_recover"] = (
+                                                tip_star_counts.get(
+                                                    "local_recover", 0
+                                                )
+                                                + 1
+                                            )
+                                        elif axis_blocks_recover and (
+                                            sat
+                                            or int(tip_hybrid_state.star_sat_streak)
+                                            >= n_sat
+                                        ):
+                                            # Force hybrid UPRIGHT — do not keep
+                                            # planar spiral target that tips peg ~50°.
+                                            tip_hybrid_state.mode = "upright"
+                                            tip_hybrid_state.upright_ok_streak = 0
+                                            tip_hybrid_state.star_mode = "yield_upright"
+                                            tip_star_counts["yield_upright"] = (
+                                                tip_star_counts.get(
+                                                    "yield_upright", 0
+                                                )
+                                                + 1
+                                            )
+                                            hyb_allow_adv = False
+                                        else:
+                                            tip_hybrid_state.star_mode = "spiral_track"
+                                            tip_star_counts["spiral_track"] = (
+                                                tip_star_counts.get(
+                                                    "spiral_track", 0
+                                                )
+                                                + 1
+                                            )
+                                # Agent-D oracle: privileged tip→mouth (not spiral chase).
+                                # Mouth = live hole-axis point at tip height (same geom as
+                                # feat.lateral_m / priv_planar). Frozen spiral_center can
+                                # diverge when spiral_n ≠ hole_axis (ep02: tip_err≈0 while
+                                # priv_planar≈15mm).
+                                # v2: keep mouth PD during SEAT/reseat (ep08 tip lag).
+                                if tip_oracle_enable and (
+                                    (not tip_hybrid_enable)
+                                    or tip_hybrid_state.mode
+                                    in ("spiral", "upright", "seat")
+                                ):
+                                    hole_u_or = np.asarray(
+                                        feat_i.hole_axis, dtype=np.float64
+                                    ).reshape(3)
+                                    hn = float(np.linalg.norm(hole_u_or))
+                                    if hn > 1e-12:
+                                        hole_u_or = hole_u_or / hn
+                                    # Control tip: tip_hat under obs_noise, else GT.
+                                    tip_servo = tip_ctrl
+                                    mouth_or = _hole_axis_point_at_tip(
+                                        tip_servo,
+                                        feat_i.socket_pos,
+                                        hole_u_or,
+                                    )
+                                    target = priv_oracle_mouth_target(
+                                        tip=tip_servo,
+                                        hole_center=mouth_or,
+                                        normal=hole_u_or,
+                                    )
+                                    hyb_allow_adv = False
+                                    tip_lat_or = float(
+                                        np.linalg.norm(
+                                            _tip_lat_offset_xy(
+                                                tip_servo, mouth_or, hole_u_or
+                                            )
+                                        )
+                                    )
+                                    if tip_obs_enable or tip_est_enable:
+                                        tip_lat_or = max(
+                                            tip_lat_or, float(tip_ctrl_lat_m)
+                                        )
+                                    else:
+                                        # Prefer feature lat (audit metric) when GT.
+                                        tip_lat_or = max(
+                                            tip_lat_or, float(feat_i.lateral_m)
+                                        )
+                                    r_cmd = max(tip_lat_or, 1e-6)
+                                # Tip drifted outside commanded ring (ep08/09): blend
+                                # target toward hole-centered radius so tip is pulled
+                                # back instead of chasing a lost spiral phase.
+                                tip_off = _tip_lat_offset_xy(
+                                    tip, spiral_center, spiral_n
+                                )
+                                tip_lat_n = float(np.linalg.norm(tip_off))
+                                if (
+                                    (not tip_oracle_enable)
+                                    and tip_lat_n > float(r_cmd) + 0.008
+                                    and tip_lat_n > 1e-9
+                                ):
+                                    ring = spiral_center + tip_off * (
+                                        float(r_cmd) / tip_lat_n
+                                    )
+                                    target = 0.5 * target + 0.5 * ring
+                            elif search_mode == "conntact_time_spiral":
+                                # Faithful ConnTact SpiralToFindHole time spiral.
+                                t_sec = float(used_sp) * float(conntact_dt)
+                                target, amp_ct = spiral_target_on_plane(
+                                    t_sec,
+                                    center=spiral_center,
+                                    t1=t1,
+                                    t2=t2,
+                                    params=conntact_params,
+                                )
+                                r_cmd = float(amp_ct)
+                            elif search_mode == "franka_spiral":
+                                # Faithful Franka jam spiral (ScriptedExpertPegV1).
+                                tip_h_now = float(tip[2])
+                                surf_h = (
+                                    float(franka_surface_h)
+                                    if franka_surface_h is not None
+                                    else tip_h_now
+                                )
+                                above_hole = tip_h_now > (
+                                    surf_h - float(franka_params.height_drop_m)
+                                )
+                                target, franka_meta_last = (
+                                    franka_spiral_target_on_plane(
+                                        franka_state,
+                                        center=spiral_center,
+                                        t1=t1,
+                                        t2=t2,
+                                        normal=spiral_n,
+                                        upward_force_n=float(contact_gate_sp),
+                                        above_hole=bool(above_hole),
+                                        params=franka_params,
+                                    )
+                                )
+                                r_cmd = float(franka_meta_last.get("r_m", 0.0))
+                            elif search_mode == "psft_spiral":
+                                # Park RA-L 2020 PSFT eq (10) → p_t on plane.
+                                target, psft_meta_last = psft_spiral_target_on_plane(
+                                    psft_state,
+                                    center=spiral_center,
+                                    t1=t1,
+                                    t2=t2,
+                                    params=psft_params,
+                                )
+                                r_cmd = float(psft_meta_last.get("r_m", 0.0))
                             elif spiral_dir == "inward":
                                 r_cmd = max(r_min, r0 - pitch * turn)
                                 target = spiral_center + r_cmd * (
@@ -3124,9 +6982,41 @@ def run_pbvs_biased_surface_press(
                                     np.cos(theta_sp) * t1 + np.sin(theta_sp) * t2
                                 )
                             err = target - tip
-                            # Keep axial for stick lift/slide; planar-only for normal search.
+                            # ConnTact SpiralToFindHole: command XY only; z=current
+                            # (force/wrench owns seeking). Dual-arm yield breaks stiction.
+                            conntact_surface_spiral = bool(
+                                spiral_along_hold
+                                and stick_phase == "search"
+                                and search_mode
+                                in (
+                                    "spiral",
+                                    "planned_spiral",
+                                    "conntact_time_spiral",
+                                    "franka_spiral",
+                                    "psft_spiral",
+                                )
+                            )
                             if stick_phase == "search":
+                                # Always planar pose error on contact/hole axis.
                                 err = err - ax_i * float(np.dot(err, ax_i))
+                            if conntact_surface_spiral:
+                                if along_hold_m is None:
+                                    along_hold_m = float(np.dot(tip_sp0, spiral_n))
+                                surface_lock_err = bool(
+                                    search_mode == "planned_spiral"
+                                    and a_cfg.get(
+                                        "surface_planned_spiral_surface_lock",
+                                        True,
+                                    )
+                                )
+                                if not surface_lock_err:
+                                    err = err + press_ax_spiral * 0.0002
+                                    depth_now = float(np.dot(tip, spiral_n))
+                                    if depth_now > along_hold_m + 0.0010:
+                                        err = err + press_ax_spiral * min(
+                                            0.0015,
+                                            0.8 * (depth_now - along_hold_m),
+                                        )
                             if (
                                 stick_phase == "search"
                                 and (
@@ -3150,16 +7040,352 @@ def run_pbvs_biased_surface_press(
                             en = float(np.linalg.norm(err))
                             # Allow larger chase when tip lags spiral (sticky surface).
                             step_lim = max_xy
+                            track_use = float(track)
+                            planned_stuck = False
+                            if search_mode == "planned_spiral" and stick_phase == "search":
+                                step_lim = max(
+                                    step_lim,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_max_step_m", 0.006
+                                        )
+                                    ),
+                                )
+                                track_use = max(
+                                    track_use,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_track", 1.2
+                                        )
+                                    ),
+                                )
+                                tip_move = float(
+                                    np.linalg.norm(tip - tip_prev_stuck)
+                                )
+                                tip_prev_stuck = tip.copy()
+                                # Soften if already lifting; force-gated stuck starts after FT.
+                                if micro_lift_left > 0:
+                                    planned_stuck = True
+                                    track_use = float(
+                                        a_cfg.get(
+                                            "surface_planned_stuck_track", 0.30
+                                        )
+                                    )
+                                    step_lim = float(
+                                        a_cfg.get(
+                                            "surface_planned_stuck_max_step_m",
+                                            0.0012,
+                                        )
+                                    )
+                                elif recontact_left > 0:
+                                    # Hold XY nearly still; press into surface.
+                                    track_use = float(
+                                        a_cfg.get(
+                                            "surface_planned_recontact_track", 0.25
+                                        )
+                                    )
+                                    step_lim = float(
+                                        a_cfg.get(
+                                            "surface_planned_recontact_max_step_m",
+                                            0.0010,
+                                        )
+                                    )
+                                else:
+                                    slide_err_m = float(
+                                        a_cfg.get(
+                                            "surface_planned_slide_err_m", 0.003
+                                        )
+                                    )
+                                    surface_lock = bool(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_surface_lock",
+                                            True,
+                                        )
+                                    )
+                                    if (
+                                        en > slide_err_m
+                                        and not surface_lock
+                                    ):
+                                        track_use = max(
+                                            track_use,
+                                            float(
+                                                a_cfg.get(
+                                                    "surface_planned_slide_track",
+                                                    1.6,
+                                                )
+                                            ),
+                                        )
+                                        step_lim = max(
+                                            step_lim,
+                                            float(
+                                                a_cfg.get(
+                                                    "surface_planned_slide_max_step_m",
+                                                    0.008,
+                                                )
+                                            ),
+                                        )
                             if en > 0.004 or stick_phase != "search":
-                                step_lim = max(max_xy, 0.006)
+                                step_lim = max(step_lim, 0.006)
                             if stick_phase == "slide":
                                 step_lim = max(step_lim, stick_slide_step)
                             if en > step_lim > 0.0:
                                 err = err * (step_lim / en)
-                            d_xy = err * track
+                            d_xy = err * track_use
                             contact, left_c, fz_r, fz_l = _wrist_contact()
                             contact_sp = float(contact)
                             spiral_resid_peak = max(spiral_resid_peak, contact_sp)
+                            # Tip-hybrid FSM (SEAT→UPRIGHT→SPIRAL). Uses tip-tray
+                            # contact when available; wrist resid as deployable fallback.
+                            tip_hybrid_omega = np.zeros(3, dtype=np.float64)
+                            tip_hybrid_soft_seat = False
+                            if (
+                                tip_hybrid_enable
+                                and search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                            ):
+                                float_m_h = max(
+                                    0.0,
+                                    _priv_tip_surface_depth_m(tip, tip_sp0, spiral_n),
+                                )
+                                # Floating over mouth: lat small but along still high.
+                                mouth_lat_h = float(
+                                    a_cfg.get("surface_spiral_mouth_lat_m", 0.0045)
+                                )
+                                along_cap_h = float(
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_max_along_m", 0.100
+                                    )
+                                )
+                                near_mouth_h = float(feat_i.lateral_m) <= mouth_lat_h * 3.0
+                                along_high_h = float(feat_i.along_m) > along_cap_h
+                                if near_mouth_h and along_high_h:
+                                    float_m_h = max(
+                                        float_m_h,
+                                        float(feat_i.along_m) - along_cap_h,
+                                    )
+                                priv_fn_h, priv_n_h = _priv_peg_tray_contact_force_n(
+                                    raw
+                                )
+                                seat_n_h = (
+                                    float(priv_fn_h)
+                                    if int(priv_n_h) > 0
+                                    else float(contact_sp)
+                                )
+                                _, axis_err_h, _ = _tip_hole_pose_err(
+                                    tip,
+                                    spiral_center,
+                                    feat_i.hole_axis,
+                                    feat_i.peg_axis,
+                                )
+                                # Hard SEAT only on geometric float / mouth-high-along.
+                                # Low contact alone → soft press boost, still spiral.
+                                hard_seat_h = float_m_h > float(
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_float_tol_m", 0.0015
+                                    )
+                                ) or (near_mouth_h and along_high_h)
+                                hyb_mode = tip_hybrid_select(
+                                    tip_hybrid_state,
+                                    float_m=float_m_h,
+                                    contact_n=seat_n_h,
+                                    axis_err_rad=float(axis_err_h),
+                                    seat_float_tol_m=float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_float_tol_m", 0.0015
+                                        )
+                                    ),
+                                    seat_contact_n=float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_contact_n", 0.05
+                                        )
+                                    ),
+                                    upright_soft_rad=float(
+                                        np.radians(
+                                            a_cfg.get(
+                                                "surface_tip_hybrid_upright_soft_deg",
+                                                18.0,
+                                            )
+                                        )
+                                    ),
+                                    upright_confirm=int(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_upright_confirm", 3
+                                        )
+                                    ),
+                                    hard_seat=bool(hard_seat_h),
+                                )
+                                # Type-B GRASP_RESTORE: keep Tip-Hybrid on SEAT while
+                                # spiral advance is frozen (reseat face contact).
+                                if tip_slip_enable and (
+                                    tip_hybrid_state.star_mode == "grasp_restore"
+                                ):
+                                    tip_hybrid_state.mode = "seat"
+                                    tip_hybrid_state.seat_ok_streak = 0
+                                    hyb_mode = "seat"
+                                tip_hybrid_mode_counts[hyb_mode] = (
+                                    tip_hybrid_mode_counts.get(hyb_mode, 0) + 1
+                                )
+                                # Soft reseat: boost press without freezing spiral.
+                                if (
+                                    hyb_mode == "spiral"
+                                    and seat_n_h
+                                    < float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_contact_n", 0.05
+                                        )
+                                    )
+                                ):
+                                    tip_hybrid_soft_seat = True
+                                    tip_hybrid_mode_counts["soft_seat"] = (
+                                        tip_hybrid_mode_counts.get("soft_seat", 0) + 1
+                                    )
+                            if search_mode == "planned_spiral" and force_hole_detect:
+                                hole_ax_h = feat_i.hole_axis / (
+                                    np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                )
+                                wr_h = read_wrist_wrench_world(raw)
+                                wh_h = wrench_in_hole_frame(wr_h[0], hole_ax_h)
+                                r_sp_now = (
+                                    float(planned_rs[min(planned_i, planned_rs.shape[0] - 1)])
+                                    if planned_rs is not None
+                                    else float(r_cmd)
+                                )
+                                # Oracle: radius + tip gate must use tip→hole planar,
+                                # not frozen spiral waypoint index / peg-body lat.
+                                tip_lat_hole = (
+                                    float(tip_ctrl_lat_m)
+                                    if (tip_obs_enable or tip_est_enable)
+                                    else float(feat_i.lateral_m)
+                                )
+                                if tip_oracle_enable:
+                                    r_sp_now = max(tip_lat_hole, 1e-6)
+                                if update_spiral_force_hole_detect(
+                                    force_hole_state,
+                                    fz_axial=float(wh_h[2]),
+                                    f_lat=float(np.linalg.norm(wh_h[:2])),
+                                    spiral_radius_m=r_sp_now,
+                                    step_idx=int(used_sp),
+                                    search_cfg=search_cfg_sp,
+                                    contact_resid_n=float(contact_sp),
+                                    tip_lat_m=tip_lat_hole,
+                                ):
+                                    print(
+                                        f"pci: FORCE hole-detect unload="
+                                        f"{force_hole_state.peak_abs_fz - abs(float(wh_h[2])):.2f}N "
+                                        f"r={r_sp_now*1e3:.1f}mm lat="
+                                        f"{tip_lat_hole*1e3:.1f}mm i={planned_i}",
+                                        flush=True,
+                                    )
+                            if search_mode == "planned_spiral" and stick_phase == "search":
+                                stuck_move_m = float(
+                                    a_cfg.get(
+                                        "surface_planned_stuck_move_m", 0.0004
+                                    )
+                                )
+                                stuck_err_m = float(
+                                    a_cfg.get(
+                                        "surface_planned_stuck_err_m", 0.004
+                                    )
+                                )
+                                stuck_f_n = float(
+                                    a_cfg.get(
+                                        "surface_planned_stuck_force_n", 0.08
+                                    )
+                                )
+                                stuck_need = int(
+                                    a_cfg.get(
+                                        "surface_planned_stuck_frames", 10
+                                    )
+                                )
+                                # Real stiction: pressed into surface AND tip not moving.
+                                near_hole_lat = float(
+                                    a_cfg.get(
+                                        "surface_planned_near_hole_lat_m", 0.016
+                                    )
+                                )
+                                if (
+                                    micro_lift_left <= 0
+                                    and float(feat_i.lateral_m) > near_hole_lat
+                                    and contact_sp >= stuck_f_n
+                                    and en >= stuck_err_m
+                                    and tip_move < stuck_move_m
+                                ):
+                                    stuck_count_sp += 1
+                                elif micro_lift_left <= 0:
+                                    stuck_count_sp = 0
+                                if (
+                                    bool(a_cfg.get("surface_planned_micro_lift_enable", False))
+                                    and micro_lift_left <= 0
+                                    and stuck_count_sp >= stuck_need
+                                ):
+                                    micro_lift_left = int(
+                                        a_cfg.get(
+                                            "surface_planned_micro_lift_frames", 8
+                                        )
+                                    )
+                                    stuck_count_sp = 0
+                                    micro_lift_count += 1
+                                    planned_stuck = True
+                                    print(
+                                        f"pci: stiction micro-lift "
+                                        f"#{micro_lift_count} "
+                                        f"|r|={contact_sp:.2f}N "
+                                        f"err={en*1e3:.1f}mm "
+                                        f"move={tip_move*1e3:.2f}mm "
+                                        f"i={planned_i}",
+                                        flush=True,
+                                    )
+                                # Lost contact while searching → re-establish surface press.
+                                lost_n = float(
+                                    a_cfg.get(
+                                        "surface_planned_lost_contact_n", 0.035
+                                    )
+                                )
+                                lost_need = int(
+                                    a_cfg.get(
+                                        "surface_planned_lost_contact_frames", 6
+                                    )
+                                )
+                                slide_err_m = float(
+                                    a_cfg.get(
+                                        "surface_planned_slide_err_m", 0.003
+                                    )
+                                )
+                                if (
+                                    recontact_left <= 0
+                                    and micro_lift_left <= 0
+                                    and contact_sp < lost_n
+                                    and en
+                                    <= float(
+                                        a_cfg.get(
+                                            "surface_planned_recontact_max_planar_m",
+                                            0.004,
+                                        )
+                                    )
+                                ):
+                                    lost_contact_count += 1
+                                else:
+                                    lost_contact_count = 0
+                                if (
+                                    recontact_left <= 0
+                                    and micro_lift_left <= 0
+                                    and lost_contact_count >= lost_need
+                                ):
+                                    recontact_left = int(
+                                        a_cfg.get(
+                                            "surface_planned_recontact_frames", 20
+                                        )
+                                    )
+                                    lost_contact_count = 0
+                                    recontact_count += 1
+                                    # Cancel pending micro-lift; need press not raise.
+                                    micro_lift_left = 0
+                                    print(
+                                        f"pci: recontact #{recontact_count} "
+                                        f"|r|={contact_sp:.2f}N "
+                                        f"err={en*1e3:.1f}mm i={planned_i}",
+                                        flush=True,
+                                    )
                             if search_mode in _priv_lat_modes and stick_phase != "search":
                                 d_stick, f_des_step, next_ph, want_live = (
                                     _tip_stick_fsm_delta(
@@ -3179,15 +7405,19 @@ def run_pbvs_biased_surface_press(
                                         clear_contact_n=stick_clear_n,
                                         mouth_lat_m=mouth_lat,
                                         lat_enter_m=stick_lat_enter,
+                                        press_frames=stick_press_frames,
                                     )
                                 )
                                 target = tip + d_stick
-                                # Cap along drift while unsticking (don't float away).
-                                if stick_along0 is not None:
+                                # Only during press: keep from floating too high after hop.
+                                if (
+                                    stick_along0 is not None
+                                    and stick_phase in ("press", "retouch")
+                                ):
                                     along_now = float(feat_i.along_m)
-                                    if along_now > stick_along0 + 0.008:
+                                    if along_now > stick_along0 + 0.010:
                                         target = target + press_ax * min(
-                                            0.0015, along_now - stick_along0 - 0.005
+                                            0.0015, along_now - stick_along0 - 0.006
                                         )
                                 # Track best lat; stall → re-lift with refreshed tip-servo offset.
                                 lat_now = float(feat_i.lateral_m)
@@ -3213,6 +7443,8 @@ def run_pbvs_biased_surface_press(
                                         )
                                         stick_lat_best = lat_now
                                         stick_stall = 0
+                                    if stick_phase == "slide" and next_ph == "press":
+                                        stick_hop_count += 1
                                     if next_ph == "mouth":
                                         stick_reached_mouth = True
                                         stick_phase = "mouth"
@@ -3231,7 +7463,8 @@ def run_pbvs_biased_surface_press(
                                 stick_active = True
                                 if stick_reached_mouth or (
                                     lat_now <= mouth_lat * 1.25
-                                    and stick_phase in ("slide", "mouth", "retouch")
+                                    and stick_phase
+                                    in ("press", "mouth", "retouch")
                                 ):
                                     stick_reached_mouth = True
                                     spiral_reason = "near_mouth"
@@ -3248,6 +7481,48 @@ def run_pbvs_biased_surface_press(
                                 f_des_step = min(float(f_des), 0.03)
                             else:
                                 stick_live_off = False
+                            if search_mode == "planned_spiral" and stick_phase == "search":
+                                # Constant light seeking force + probe press at every
+                                # waypoint (ConnTact-style). Do NOT raise f_des from
+                                # priv lat — hole enter is F/T drop only.
+                                f_des_step = min(
+                                    float(f_des_step),
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_f_des_n", 0.06
+                                        )
+                                    ),
+                                )
+                                if (
+                                    not bool(
+                                        a_cfg.get(
+                                            "surface_planned_force_hole_only", False
+                                        )
+                                    )
+                                    and float(feat_i.lateral_m)
+                                    <= float(
+                                        a_cfg.get(
+                                            "surface_planned_near_hole_lat_m", 0.016
+                                        )
+                                    )
+                                    and not bool(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_surface_lock",
+                                            True,
+                                        )
+                                    )
+                                ):
+                                    f_des_step = max(
+                                        float(f_des_step),
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_near_hole_f_des_n",
+                                                0.18,
+                                            )
+                                        ),
+                                    )
+                                    micro_lift_left = 0
+                                    stuck_count_sp = 0
                             err_f = f_des_step - contact_sp
                             ax_step = float(np.clip(kp * err_f, -max_step, max_step))
                             if err_f < 0.0:
@@ -3258,19 +7533,256 @@ def run_pbvs_biased_surface_press(
                                         max_step,
                                     )
                                 )
+                            # Planned spiral: displacement along desired-force direction
+                            # (into surface) to HOLD contact while XY tracks the path.
+                            if (
+                                search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                                and micro_lift_left <= 0
+                                and bool(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_surface_lock", True
+                                    )
+                                )
+                            ):
+                                depth_err_ax = _priv_tip_surface_depth_m(
+                                    tip, tip_sp0, spiral_n
+                                )
+                                ax_step = _priv_planned_surface_ax_step(
+                                    a_cfg,
+                                    contact_sp=contact_sp,
+                                    f_des_step=f_des_step,
+                                    depth_err=depth_err_ax,
+                                    planar_err_m=en,
+                                    kp=kp,
+                                    max_step=max_step,
+                                )
+                                # Hard clamp: probe spiral never large lift-off,
+                                # but allow tiny unload when residual is heavy.
+                                if (
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.0
+                                        )
+                                    )
+                                    > 1e-9
+                                    and float(ax_step) < 0.0
+                                ):
+                                    heavy_n = float(
+                                        a_cfg.get(
+                                            "surface_planned_heavy_resid_n",
+                                            0.45,
+                                        )
+                                    )
+                                    if float(contact_sp) < heavy_n:
+                                        ax_step = 0.0
+                                    else:
+                                        ax_step = float(
+                                            max(
+                                                ax_step,
+                                                -float(
+                                                    a_cfg.get(
+                                                        "surface_planned_seek_unload_cap_m",
+                                                        0.00012,
+                                                    )
+                                                ),
+                                            )
+                                        )
+                            elif (
+                                search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                                and micro_lift_left <= 0
+                                and not bool(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_surface_lock", True
+                                    )
+                                )
+                            ):
+                                # Non-lock seek: press along hole normal + probe floor.
+                                hole_u_seek = feat_i.hole_axis / (
+                                    np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                )
+                                press_ax_spiral = -hole_u_seek
+                                seek_max = float(
+                                    a_cfg.get(
+                                        "surface_planned_seek_step_m", 0.00055
+                                    )
+                                )
+                                probe_m = float(
+                                    a_cfg.get("surface_planned_probe_press_m", 0.00006)
+                                )
+                                if err_f > 0.0:
+                                    frac = float(
+                                        np.clip(
+                                            err_f / max(float(f_des_step), 1e-6),
+                                            0.0,
+                                            1.0,
+                                        )
+                                    )
+                                    ax_step = max(ax_step, seek_max * frac)
+                                elif err_f < 0.0:
+                                    over = float(
+                                        np.clip(
+                                            (-err_f)
+                                            / max(float(f_des_step), 1e-6),
+                                            0.0,
+                                            2.0,
+                                        )
+                                    )
+                                    ax_step = min(
+                                        ax_step,
+                                        -seek_max * max(0.35, over),
+                                    )
+                                else:
+                                    ax_step = max(float(ax_step), probe_m)
+                                if contact_sp <= float(
+                                    a_cfg.get(
+                                        "surface_planned_force_overload_n", 0.055
+                                    )
+                                ):
+                                    ax_step = max(float(ax_step), probe_m)
+                            if (
+                                search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                                and micro_lift_left > 0
+                            ):
+                                lift_m = float(
+                                    a_cfg.get(
+                                        "surface_planned_micro_lift_m", 0.0008
+                                    )
+                                )
+                                # Raise along contact normal (opposite seeking).
+                                ax_step = -lift_m
+                                micro_lift_left -= 1
+                                # Already unloaded → stop lifting early, resume track.
+                                if contact_sp < float(
+                                    a_cfg.get(
+                                        "surface_planned_micro_lift_end_n", 0.04
+                                    )
+                                ):
+                                    micro_lift_left = 0
+                                if used_sp % 5 == 0 or micro_lift_left == 0:
+                                    print(
+                                        f"pci: micro-lift step left={micro_lift_left} "
+                                        f"|r|={contact_sp:.2f}N err={en*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                            elif (
+                                search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                                and recontact_left > 0
+                            ):
+                                # Press back onto surface (ConnTact seeking).
+                                press_m = float(
+                                    a_cfg.get(
+                                        "surface_planned_recontact_step_m", 0.0006
+                                    )
+                                )
+                                # Prefer hole-axis into-surface if contact normal drifted.
+                                hole_u_now = feat_i.hole_axis / (
+                                    np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                )
+                                press_re = -hole_u_now
+                                ax_step = max(ax_step, press_m)
+                                # Also reseat tip toward start contact depth along hole.
+                                along0 = float(feat_sp0.along_m)
+                                along_now = float(feat_i.along_m)
+                                if along_now > along0 + 0.001:
+                                    # tip rose out of hole → push back along insert.
+                                    hold_boost = min(
+                                        0.0020, 0.5 * (along_now - along0)
+                                    )
+                                    # Inject via larger ax_step (applied with press_use below).
+                                    ax_step = max(ax_step, press_m + hold_boost)
+                                    # Switch press axis to hole for this frame.
+                                    press_ax_spiral = press_re
+                                f_des_step = max(
+                                    float(f_des_step),
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_recontact_f_des_n", 0.18
+                                        )
+                                    ),
+                                )
+                                recontact_left -= 1
+                                ok_n = float(
+                                    a_cfg.get(
+                                        "surface_planned_recontact_ok_n", 0.08
+                                    )
+                                )
+                                if contact_sp >= ok_n and along_now <= along0 + 0.008:
+                                    recontact_left = 0
+                                    print(
+                                        f"pci: recontact OK |r|={contact_sp:.2f}N "
+                                        f"along={along_now*1e3:.1f}mm i={planned_i}",
+                                        flush=True,
+                                    )
+                                elif used_sp % 5 == 0 or recontact_left == 0:
+                                    print(
+                                        f"pci: recontact step left={recontact_left} "
+                                        f"|r|={contact_sp:.2f}N "
+                                        f"along={along_now*1e3:.1f}mm",
+                                        flush=True,
+                                    )
                             # Extra unload when stuck with pose error.
                             if stick_phase != "search" and contact_sp > f_des_step:
                                 ax_step = min(
                                     ax_step,
                                     -max_step * unload_boost,
                                 )
-                            # Lift/slide: never press into surface (breaks clear-then-slide).
-                            if stick_phase in ("lift", "slide"):
+                            # Lift: unload only. Slide: keep ConnTact-style seeking force.
+                            if stick_phase == "lift":
                                 ax_step = min(0.0, ax_step)
+                            if (
+                                search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                                and micro_lift_left <= 0
+                                and float(feat_i.lateral_m)
+                                <= float(
+                                    a_cfg.get(
+                                        "surface_planned_insert_lat_m", 0.010
+                                    )
+                                )
+                                and (
+                                    force_hole_state.entered
+                                    if force_hole_detect
+                                    else priv_hole_entered
+                                )
+                            ):
+                                # Hole found — force-control into mouth.
+                                ax_step = max(
+                                    ax_step,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_insert_step_m", 0.00045
+                                        )
+                                    ),
+                                )
+                                f_des_step = max(
+                                    float(f_des_step),
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_insert_f_des_n", 0.22
+                                        )
+                                    ),
+                                )
+                                press_ax_spiral = -(
+                                    feat_i.hole_axis
+                                    / (np.linalg.norm(feat_i.hole_axis) + 1e-12)
+                                )
                             # Wrist := tip_target + offset.
                             site_xyz = site_now[0:3].copy()
                             if stick_phase == "slide" and stick_offset_wt is not None:
                                 offset_wt = stick_offset_wt
+                            elif search_mode == "planned_spiral" and stick_phase == "search":
+                                if bool(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_freeze_offset", True
+                                    )
+                                ):
+                                    offset_wt = offset_wt0_sp
+                                else:
+                                    offset_wt = site_xyz - tip
                             elif (
                                 freeze_off
                                 and (not stick_live_off)
@@ -3279,12 +7791,1007 @@ def run_pbvs_biased_surface_press(
                                 offset_wt = offset_wt0_sp
                             else:
                                 offset_wt = site_xyz - tip
-                            hold_r = target + offset_wt + press_ax * ax_step
+                            press_use = (
+                                press_ax_spiral
+                                if (
+                                    spiral_along_hold
+                                    and search_mode
+                                    in (
+                                        "spiral",
+                                        "planned_spiral",
+                                        "franka_spiral",
+                                        "psft_spiral",
+                                        "conntact_time_spiral",
+                                    )
+                                    and stick_phase == "search"
+                                )
+                                else press_ax
+                            )
+                            if (
+                                franka_faithful
+                                and tip_baseline_mode
+                                and stick_phase == "search"
+                            ):
+                                # Franka TCP track: wrist → spiral target (rigid-EE assumption).
+                                # Jam lift: ref sets absolute z=hole_top+0.040; soft sim
+                                # applies repeated unload along contact normal (disclose).
+                                _jammed_now = bool(
+                                    franka_meta_last.get("jammed", False)
+                                )
+                                if _jammed_now:
+                                    ax_step = -float(
+                                        a_cfg.get(
+                                            "surface_franka_jam_lift_step_m",
+                                            0.003,
+                                        )
+                                    )
+                                hold_r, _bl_meta, ax_step = baseline_hold_r(
+                                    tip_baseline_mode,
+                                    target=target,
+                                    tip=tip,
+                                    site_xyz=site_xyz,
+                                    offset_frozen=offset_wt0_sp,
+                                    coupling=tip_coupling_est,
+                                    planar_coupling=tip_planar_coupling_est,
+                                    coupling_ekf=tip_coupling_ekf,
+                                    qp_lambda_reg=float(
+                                        a_cfg.get("surface_tip_qp_lambda_reg", 0.12)
+                                    ),
+                                    spiral_n=spiral_n,
+                                    press_ax=press_use,
+                                    ax_step=ax_step,
+                                    track=float(track_use),
+                                    max_step_m=float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_max_wrist_step_m",
+                                            0.008,
+                                        )
+                                    ),
+                                    along_now_m=float(feat_i.along_m),
+                                    along0_m=along0_spiral,
+                                    hole_axis=feat_i.hole_axis,
+                                    along_slack_m=float(
+                                        a_cfg.get(
+                                            "surface_planned_along_hold_slack_m",
+                                            0.0025,
+                                        )
+                                    ),
+                                    tip_anchor=None,
+                                    contact_resid_n=float(contact_sp),
+                                    f_des_n=float(f_des_step),
+                                    planar_gate_n=float(
+                                        a_cfg.get(
+                                            "surface_planned_planar_force_gate_n",
+                                            0.052,
+                                        )
+                                    ),
+                                    overload_n=float(
+                                        a_cfg.get(
+                                            "surface_planned_force_overload_n",
+                                            0.070,
+                                        )
+                                    ),
+                                    overload_planar_scale=float(
+                                        a_cfg.get(
+                                            "surface_planned_overload_planar_scale",
+                                            0.12,
+                                        )
+                                    ),
+                                    planar_ramp=1.0,
+                                    heavy_unload_m=float(
+                                        a_cfg.get(
+                                            "surface_planned_heavy_unload_m",
+                                            0.0015,
+                                        )
+                                    ),
+                                    grasp_slip_m=float(_update_grasp_slip()),
+                                    force_gate_enable=False,
+                                    force_gate_axial=False,
+                                )
+                            elif (
+                                psft_faithful
+                                and tip_baseline_mode
+                                and stick_phase == "search"
+                            ):
+                                # PSFT paper eqs (3)/(10)/(13): TCP toward p_t (rigid EE).
+                                hold_r, _bl_meta, ax_step = baseline_hold_r(
+                                    tip_baseline_mode,
+                                    target=target,
+                                    tip=tip,
+                                    site_xyz=site_xyz,
+                                    offset_frozen=offset_wt0_sp,
+                                    coupling=tip_coupling_est,
+                                    planar_coupling=tip_planar_coupling_est,
+                                    coupling_ekf=tip_coupling_ekf,
+                                    qp_lambda_reg=float(
+                                        a_cfg.get("surface_tip_qp_lambda_reg", 0.12)
+                                    ),
+                                    spiral_n=spiral_n,
+                                    press_ax=press_use,
+                                    ax_step=ax_step,
+                                    track=float(track_use),
+                                    max_step_m=float(
+                                        a_cfg.get(
+                                            "surface_psft_max_wrist_step_m",
+                                            a_cfg.get(
+                                                "surface_planned_spiral_max_wrist_step_m",
+                                                0.008,
+                                            ),
+                                        )
+                                    ),
+                                    along_now_m=float(feat_i.along_m),
+                                    along0_m=along0_spiral,
+                                    hole_axis=feat_i.hole_axis,
+                                    along_slack_m=float(
+                                        a_cfg.get(
+                                            "surface_planned_along_hold_slack_m",
+                                            0.0025,
+                                        )
+                                    ),
+                                    tip_anchor=None,
+                                    contact_resid_n=float(contact_sp),
+                                    f_des_n=float(f_des_step),
+                                    planar_gate_n=float(
+                                        a_cfg.get(
+                                            "surface_planned_planar_force_gate_n",
+                                            0.052,
+                                        )
+                                    ),
+                                    overload_n=float(
+                                        a_cfg.get(
+                                            "surface_planned_force_overload_n",
+                                            0.070,
+                                        )
+                                    ),
+                                    overload_planar_scale=float(
+                                        a_cfg.get(
+                                            "surface_planned_overload_planar_scale",
+                                            0.12,
+                                        )
+                                    ),
+                                    planar_ramp=1.0,
+                                    heavy_unload_m=float(
+                                        a_cfg.get(
+                                            "surface_planned_heavy_unload_m",
+                                            0.0015,
+                                        )
+                                    ),
+                                    grasp_slip_m=float(_update_grasp_slip()),
+                                    force_gate_enable=False,
+                                    force_gate_axial=False,
+                                )
+                            elif search_mode == "planned_spiral" and stick_phase == "search":
+                                # Privileged on-surface spiral: planar FF + light press along contact normal.
+                                press_use = press_ax_spiral
+                                if tip_baseline_mode:
+                                    _paper_planar_c = tip_baseline_mode in (
+                                        "planar_c",
+                                        "planar_c_matrix",
+                                        "s8",
+                                        "ekf_qp",
+                                        "s9",
+                                        "priv_oracle_tip_servo",
+                                        "oracle_tip",
+                                        "oracle",
+                                        "priv_oracle_tip_obs",
+                                    ) or bool(tip_oracle_enable)
+                                    _bl_plane = (
+                                        float(
+                                            a_cfg.get(
+                                                "surface_baseline_plane_lift_m",
+                                                0.0,
+                                            )
+                                        )
+                                        if tip_baseline_mode
+                                        in ("planar_coupling", "s7")
+                                        else 0.0
+                                    )
+                                    _bl_press = (
+                                        float(
+                                            a_cfg.get(
+                                                "surface_baseline_plane_press_m",
+                                                0.0,
+                                            )
+                                        )
+                                        if tip_baseline_mode
+                                        in ("planar_coupling", "s7")
+                                        else 0.0
+                                    )
+                                    _bl_hard_along = (
+                                        float(
+                                            a_cfg.get(
+                                                "surface_baseline_hard_along_m",
+                                                0.006,
+                                            )
+                                        )
+                                        if tip_baseline_mode
+                                        in ("planar_coupling", "s7")
+                                        else None
+                                    )
+                                    _grasp_slip_now = float(_update_grasp_slip())
+                                    _planar_ramp = float(
+                                        np.clip(
+                                            (
+                                                float(used_sp)
+                                                - max(
+                                                    int(
+                                                        a_cfg.get(
+                                                            "surface_planned_force_seat_frames",
+                                                            0,
+                                                        )
+                                                    ),
+                                                    1,
+                                                )
+                                            )
+                                            / max(
+                                                float(
+                                                    a_cfg.get(
+                                                        "surface_planned_planar_ramp_frames",
+                                                        120,
+                                                    )
+                                                ),
+                                                1.0,
+                                            ),
+                                            0.0,
+                                            1.0,
+                                        )
+                                    )
+                                    _or_track = float(track_use)
+                                    _or_max = float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_max_wrist_step_m",
+                                            0.008,
+                                        )
+                                    )
+                                    _or_gate = True
+                                    if tip_oracle_enable:
+                                        # Upper-bound tip PD: do not crush XY chase.
+                                        _or_track = max(
+                                            _or_track,
+                                            float(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_track", 2.5
+                                                )
+                                            ),
+                                        )
+                                        _or_max = max(
+                                            _or_max,
+                                            float(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_max_step_m",
+                                                    0.018,
+                                                )
+                                            ),
+                                        )
+                                        _or_gate = bool(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_force_gate",
+                                                False,
+                                            )
+                                        )
+                                        _planar_ramp = 1.0
+                                    if tip_phig_enable:
+                                        # Known-path wrist track: keep planar alive.
+                                        _or_gate = bool(
+                                            a_cfg.get(
+                                                "surface_tip_phig_force_gate", False
+                                            )
+                                        )
+                                        _planar_ramp = 1.0
+                                        _or_max = max(
+                                            _or_max,
+                                            float(phig_cfg.max_step_m),
+                                        )
+                                    _or_n = spiral_n
+                                    if tip_oracle_enable:
+                                        _hu = np.asarray(
+                                            feat_i.hole_axis, dtype=np.float64
+                                        ).reshape(3)
+                                        _hn = float(np.linalg.norm(_hu))
+                                        if _hn > 1e-12:
+                                            _or_n = _hu / _hn
+                                    hold_r, _bl_meta, ax_step = baseline_hold_r(
+                                        tip_baseline_mode,
+                                        target=target,
+                                        tip=(
+                                            tip_ctrl
+                                            if (
+                                                tip_oracle_enable
+                                                or (
+                                                    tip_gmhqp_tip_obs
+                                                    and tip_theory_ekf is not None
+                                                )
+                                            )
+                                            else tip
+                                        ),
+                                        site_xyz=site_xyz,
+                                        offset_frozen=offset_wt0_sp,
+                                        coupling=tip_coupling_est,
+                                        planar_coupling=tip_planar_coupling_est,
+                                        coupling_ekf=tip_coupling_ekf,
+                                        qp_lambda_reg=float(
+                                            a_cfg.get(
+                                                "surface_tip_qp_lambda_reg", 0.12
+                                            )
+                                        ),
+                                        spiral_n=_or_n,
+                                        press_ax=press_use,
+                                        ax_step=ax_step,
+                                        track=_or_track,
+                                        max_step_m=_or_max,
+                                        along_now_m=float(feat_i.along_m),
+                                        along0_m=along0_spiral,
+                                        hole_axis=feat_i.hole_axis,
+                                        along_slack_m=float(
+                                            a_cfg.get(
+                                                "surface_planned_along_hold_slack_m",
+                                                0.0025,
+                                            )
+                                        ),
+                                        tip_anchor=tip_sp0
+                                        if _paper_planar_c
+                                        or _bl_plane > 0
+                                        or _bl_press > 0
+                                        or tip_gmhqp_ftip_enable
+                                        or tip_gmhqp_compc_enable
+                                        or tip_gmhqp_ac_enable
+                                        else None,
+                                        surface_lock_lift_m=_bl_plane,
+                                        surface_lock_press_m=_bl_press,
+                                        hard_along_slack_m=_bl_hard_along,
+                                        contact_resid_n=float(contact_sp),
+                                        f_des_n=float(f_des_step),
+                                        planar_gate_n=float(
+                                            a_cfg.get(
+                                                "surface_planned_planar_force_gate_n",
+                                                0.052,
+                                            )
+                                        ),
+                                        overload_n=float(
+                                            a_cfg.get(
+                                                "surface_planned_force_overload_n",
+                                                0.070,
+                                            )
+                                        ),
+                                        overload_planar_scale=float(
+                                            a_cfg.get(
+                                                "surface_planned_overload_planar_scale",
+                                                0.12,
+                                            )
+                                        ),
+                                        planar_ramp=_planar_ramp,
+                                        heavy_unload_m=float(
+                                            a_cfg.get(
+                                                "surface_planned_heavy_unload_m",
+                                                0.0015,
+                                            )
+                                        ),
+                                        grasp_slip_m=_grasp_slip_now,
+                                        force_gate_enable=_or_gate,
+                                        # Keep axial probe during spiral; planar gate
+                                        # still scales XY chase on overload/slip.
+                                        force_gate_axial=False
+                                        if float(
+                                            a_cfg.get(
+                                                "surface_planned_probe_press_m", 0.0
+                                            )
+                                        )
+                                        > 1e-9
+                                        else not (
+                                            force_hole_detect
+                                            and force_hole_state.entered
+                                            and bool(
+                                                a_cfg.get(
+                                                    "surface_planned_insert_on_force_only",
+                                                    True,
+                                                )
+                                            )
+                                        ),
+                                        phig_cfg=phig_cfg if tip_phig_enable else None,
+                                        wrench_xyz=(
+                                            np.asarray(
+                                                read_wrist_wrench_world(raw)[0][:3],
+                                                dtype=np.float64,
+                                            ).reshape(3)
+                                            if (
+                                                tip_phig_enable
+                                                or tip_clep_enable
+                                                or tip_fasr_enable
+                                                or tip_gmhqp_ftip_enable
+                                                or tip_gmhqp_compc_enable
+                                            )
+                                            else None
+                                        ),
+                                        wrench_tau_xyz=(
+                                            np.asarray(
+                                                read_wrist_wrench_world(raw)[0][3:6],
+                                                dtype=np.float64,
+                                            ).reshape(3)
+                                            if (
+                                                tip_clep_enable
+                                                or tip_gmhqp_ftip_enable
+                                                or tip_gmhqp_compc_enable
+                                            )
+                                            else None
+                                        ),
+                                        clep_cfg=(
+                                            clep_cfg if tip_clep_enable else None
+                                        ),
+                                        clep_state=(
+                                            clep_state if tip_clep_enable else None
+                                        ),
+                                        fasr_cfg=(
+                                            fasr_cfg if tip_fasr_enable else None
+                                        ),
+                                        fasr_state=(
+                                            fasr_state if tip_fasr_enable else None
+                                        ),
+                                        oigs_cfg=(
+                                            oigs_cfg if tip_oigs_enable else None
+                                        ),
+                                        oigs_state=(
+                                            oigs_state if tip_oigs_enable else None
+                                        ),
+                                        gmhqp_cfg=(
+                                            gmhqp_cfg if tip_gmhqp_enable else None
+                                        ),
+                                        gmhqp_state=(
+                                            gmhqp_state if tip_gmhqp_enable else None
+                                        ),
+                                        gmhqp_ftip_cfg=(
+                                            gmhqp_ftip_cfg
+                                            if tip_gmhqp_ftip_enable
+                                            else None
+                                        ),
+                                        gmhqp_ftip_state=(
+                                            gmhqp_ftip_state
+                                            if tip_gmhqp_ftip_enable
+                                            else None
+                                        ),
+                                        gmhqp_compc_cfg=(
+                                            gmhqp_compc_cfg
+                                            if tip_gmhqp_compc_enable
+                                            else None
+                                        ),
+                                        gmhqp_compc_state=(
+                                            gmhqp_compc_state
+                                            if tip_gmhqp_compc_enable
+                                            else None
+                                        ),
+                                        gmhqp_ac_cfg=(
+                                            gmhqp_ac_cfg
+                                            if tip_gmhqp_ac_enable
+                                            else None
+                                        ),
+                                        gmhqp_ac_state=(
+                                            gmhqp_ac_state
+                                            if tip_gmhqp_ac_enable
+                                            else None
+                                        ),
+                                        hybrid_gmhqp_cfg=(
+                                            hybrid_gmhqp_cfg
+                                            if tip_hybrid_gmhqp_enable
+                                            else None
+                                        ),
+                                        hybrid_gmhqp_state=(
+                                            hybrid_gmhqp_state
+                                            if tip_hybrid_gmhqp_enable
+                                            else None
+                                        ),
+                                        hard_hqp_cfg=(
+                                            hard_hqp_cfg
+                                            if tip_hard_hqp_enable
+                                            else None
+                                        ),
+                                        axis_err_deg=float(
+                                            np.degrees(
+                                                float(
+                                                    getattr(
+                                                        feat_i, "axis_error_rad", 0.0
+                                                    )
+                                                    or 0.0
+                                                )
+                                            )
+                                        ),
+                                        peg_axis=getattr(feat_i, "peg_axis", None),
+                                        r_cmd_m=float(r_cmd),
+                                        mouth_xyz=(
+                                            np.asarray(
+                                                spiral_center, dtype=np.float64
+                                            ).reshape(3)
+                                            if tip_gmhqp_compc_enable
+                                            else None
+                                        ),
+                                    )
+                                    # Enforce probe floor after baseline (never cancel).
+                                    _probe_floor = float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.0
+                                        )
+                                    )
+                                    _hard_ax = float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_hard_unload_n",
+                                            0.35,
+                                        )
+                                    )
+                                    if (
+                                        _probe_floor > 1e-9
+                                        and float(contact_sp) <= _hard_ax
+                                        and stick_phase == "search"
+                                        and micro_lift_left <= 0
+                                        and float(ax_step) >= -1e-12
+                                    ):
+                                        # Never cancel an unload with probe floor.
+                                        ax_step = max(float(ax_step), _probe_floor)
+                                        _pu = press_use / (
+                                            np.linalg.norm(press_use) + 1e-12
+                                        )
+                                        _ax_now = float(
+                                            np.dot(hold_r - site_xyz, _pu)
+                                        )
+                                        if _ax_now + 1e-9 < float(ax_step):
+                                            hold_r = hold_r + _pu * (
+                                                float(ax_step) - _ax_now
+                                            )
+                                    # Agent-D oracle v2: stronger axial press near mouth
+                                    # (ep03 force-enter) and reseat press on slip freeze.
+                                    if tip_oracle_enable:
+                                        _pu_or = press_use / (
+                                            np.linalg.norm(press_use) + 1e-12
+                                        )
+                                        mouth_lat_or = float(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_mouth_press_lat_m",
+                                                a_cfg.get(
+                                                    "surface_spiral_mouth_lat_m",
+                                                    0.0045,
+                                                ),
+                                            )
+                                        )
+                                        tip_lat_or_now = (
+                                            float(tip_ctrl_lat_m)
+                                            if (tip_obs_enable or tip_est_enable)
+                                            else float(feat_i.lateral_m)
+                                        )
+                                        axis_deg_or = float(
+                                            np.degrees(
+                                                float(
+                                                    getattr(
+                                                        feat_i, "axis_error_rad", 0.0
+                                                    )
+                                                )
+                                            )
+                                        )
+                                        max_axis_or = float(
+                                            a_cfg.get(
+                                                "surface_planned_priv_enter_max_axis_err_deg",
+                                                25.0,
+                                            )
+                                        )
+                                        reseat_left_or = int(
+                                            tip_hybrid_state.oracle_reseat_left
+                                        )
+                                        if reseat_left_or > 0 and bool(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_slip_reseat",
+                                                False,
+                                            )
+                                        ):
+                                            # Axial reseat + grasp already tightened;
+                                            # KEEP tip→mouth planar (scaled), do not
+                                            # zero XY — that starved ep08 mouth reach.
+                                            reseat_press = float(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_reseat_press_m",
+                                                    0.00045,
+                                                )
+                                            )
+                                            ax_step = max(float(ax_step), reseat_press)
+                                            planar_scale_or = float(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_reseat_planar_scale",
+                                                    0.35,
+                                                )
+                                            )
+                                            d_h = hold_r - site_xyz
+                                            ax_comp = float(np.dot(d_h, _pu_or))
+                                            planar_h = d_h - _pu_or * ax_comp
+                                            hold_r = (
+                                                site_xyz
+                                                + planar_h * planar_scale_or
+                                                + _pu_or * float(ax_step)
+                                            )
+                                        elif (
+                                            bool(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_mouth_press",
+                                                    False,
+                                                )
+                                            )
+                                            and tip_lat_or_now <= mouth_lat_or
+                                            and stick_phase == "search"
+                                            and micro_lift_left <= 0
+                                            and reseat_left_or <= 0
+                                        ):
+                                            # Tip-Hybrid: if axis bad, UPRIGHT first —
+                                            # do not jam sideways into mouth (ep03/07).
+                                            if axis_deg_or > max_axis_or:
+                                                tip_hybrid_state.mode = "upright"
+                                                tip_hybrid_state.upright_ok_streak = 0
+                                            else:
+                                                press_or = float(
+                                                    a_cfg.get(
+                                                        "surface_tip_oracle_mouth_press_m",
+                                                        0.00035,
+                                                    )
+                                                )
+                                                hard_or = float(
+                                                    a_cfg.get(
+                                                        "surface_tip_oracle_mouth_hard_unload_n",
+                                                        0.85,
+                                                    )
+                                                )
+                                                if float(contact_sp) <= hard_or:
+                                                    ax_step = max(
+                                                        float(ax_step), press_or
+                                                    )
+                                                    hole_u_mp = np.asarray(
+                                                        feat_i.hole_axis,
+                                                        dtype=np.float64,
+                                                    ).reshape(3)
+                                                    hn_mp = float(
+                                                        np.linalg.norm(hole_u_mp)
+                                                    )
+                                                    if hn_mp > 1e-12:
+                                                        press_use = -(
+                                                            hole_u_mp / hn_mp
+                                                        )
+                                                        _pu_or = press_use
+                                                    _ax_now2 = float(
+                                                        np.dot(
+                                                            hold_r - site_xyz, _pu_or
+                                                        )
+                                                    )
+                                                    if _ax_now2 + 1e-9 < float(
+                                                        ax_step
+                                                    ):
+                                                        hold_r = hold_r + _pu_or * (
+                                                            float(ax_step) - _ax_now2
+                                                        )
+                                                    tip_hybrid_state.oracle_mouth_press_frames = (
+                                                        int(
+                                                            tip_hybrid_state.oracle_mouth_press_frames
+                                                        )
+                                                        + 1
+                                                    )
+                                    # Track-B PHIG: mouth press / slip reseat axial
+                                    # (r_cmd + F/T only — no tip_lat GT gate).
+                                    if tip_phig_enable:
+                                        _pu_ph = press_use / (
+                                            np.linalg.norm(press_use) + 1e-12
+                                        )
+                                        if phig_state.mode == "slip_reseat":
+                                            ax_step = phig_axial_override(
+                                                mode="slip_reseat",
+                                                ax_step=float(ax_step),
+                                                cfg=phig_cfg,
+                                            )
+                                            planar_scale_ph = float(
+                                                a_cfg.get(
+                                                    "surface_tip_phig_reseat_planar_scale",
+                                                    0.45,
+                                                )
+                                            )
+                                            d_h = hold_r - site_xyz
+                                            ax_comp = float(np.dot(d_h, _pu_ph))
+                                            planar_h = d_h - _pu_ph * ax_comp
+                                            hold_r = (
+                                                site_xyz
+                                                + planar_h * planar_scale_ph
+                                                + _pu_ph * float(ax_step)
+                                            )
+                                        elif (
+                                            phig_state.mode == "mouth_press"
+                                            and stick_phase == "search"
+                                            and micro_lift_left <= 0
+                                        ):
+                                            # Re-check deployable near-mouth (no tip GT).
+                                            r_cmd_mp = (
+                                                float(planned_rs[planned_i])
+                                                if planned_rs is not None
+                                                else 1.0
+                                            )
+                                            near_mp = phig_near_mouth(
+                                                r_cmd_m=r_cmd_mp,
+                                                contact_resid_n=float(contact_sp),
+                                                force_hole_cue=bool(
+                                                    force_hole_state.entered
+                                                ),
+                                                mouth_r_m=float(phig_cfg.mouth_r_m),
+                                                f_mouth_press_n=float(
+                                                    phig_cfg.f_mouth_press_n
+                                                ),
+                                            )
+                                            if near_mp and float(contact_sp) <= float(
+                                                phig_cfg.mouth_hard_unload_n
+                                            ):
+                                                ax_step = phig_axial_override(
+                                                    mode="mouth_press",
+                                                    ax_step=float(ax_step),
+                                                    cfg=phig_cfg,
+                                                )
+                                                hole_u_mp = np.asarray(
+                                                    feat_i.hole_axis,
+                                                    dtype=np.float64,
+                                                ).reshape(3)
+                                                hn_mp = float(
+                                                    np.linalg.norm(hole_u_mp)
+                                                )
+                                                if hn_mp > 1e-12:
+                                                    press_use = -(hole_u_mp / hn_mp)
+                                                    _pu_ph = press_use
+                                                _ax_now_ph = float(
+                                                    np.dot(hold_r - site_xyz, _pu_ph)
+                                                )
+                                                if _ax_now_ph + 1e-9 < float(ax_step):
+                                                    hold_r = hold_r + _pu_ph * (
+                                                        float(ax_step) - _ax_now_ph
+                                                    )
+                                                phig_state.mouth_press_frames = int(
+                                                    phig_state.mouth_press_frames
+                                                ) + 1
+                                        elif phig_state.mode == "enter_hold":
+                                            tip_hybrid_state.mode = "upright"
+                                            tip_hybrid_state.upright_ok_streak = 0
+                                else:
+                                    surface_lock = bool(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_surface_lock",
+                                            True,
+                                        )
+                                    )
+                                if not tip_baseline_mode and surface_lock:
+                                    planar = target - tip
+                                    planar = planar - spiral_n * float(
+                                        np.dot(planar, spiral_n)
+                                    )
+                                    planar_scale = 1.0
+                                    overload_n = float(
+                                        a_cfg.get(
+                                            "surface_planned_force_overload_n",
+                                            0.070,
+                                        )
+                                    )
+                                    planar_gate_n = float(
+                                        a_cfg.get(
+                                            "surface_planned_planar_force_gate_n",
+                                            0.052,
+                                        )
+                                    )
+                                    seat_frames = int(
+                                        a_cfg.get(
+                                            "surface_planned_force_seat_frames", 0
+                                        )
+                                    )
+                                    force_seat_sp = (
+                                        seat_frames > 0 and used_sp <= seat_frames
+                                    )
+                                    lift_tol = float(
+                                        a_cfg.get(
+                                            "surface_planned_surface_lift_tol_m",
+                                            0.0006,
+                                        )
+                                    )
+                                    heavy_unload = float(
+                                        a_cfg.get(
+                                            "surface_planned_heavy_unload_m",
+                                            0.0015,
+                                        )
+                                    )
+                                    overloaded = (
+                                        float(contact_sp) > planar_gate_n
+                                        or float(contact_sp)
+                                        > float(f_des_step) * 1.15
+                                    )
+                                    if float(contact_sp) > overload_n:
+                                        overload_cooldown_sp = max(
+                                            overload_cooldown_sp,
+                                            int(
+                                                a_cfg.get(
+                                                    "surface_planned_overload_cooldown_frames",
+                                                    18,
+                                                )
+                                            ),
+                                        )
+                                    if overload_cooldown_sp > 0:
+                                        overload_cooldown_sp -= 1
+                                        overloaded = True
+                                    if force_seat_sp or overloaded:
+                                        planar_scale = 0.0
+                                    if force_seat_sp and not overloaded:
+                                        f_tol = float(
+                                            a_cfg.get(
+                                                "surface_planned_force_ok_tol_n",
+                                                0.008,
+                                            )
+                                        )
+                                        if (
+                                            float(contact_sp) >= 0.006
+                                            and float(contact_sp)
+                                            <= float(f_des_step) + f_tol
+                                        ):
+                                            ax_step = 0.0
+                                    elif overloaded:
+                                        over = max(
+                                            float(contact_sp) - float(f_des_step),
+                                            0.0,
+                                        )
+                                        ax_step = -max(
+                                            heavy_unload,
+                                            min(
+                                                0.004,
+                                                heavy_unload
+                                                * max(
+                                                    1.0,
+                                                    over
+                                                    / max(
+                                                        float(f_des_step), 1e-6
+                                                    ),
+                                                ),
+                                            ),
+                                        )
+                                        lift_tol = float(
+                                            a_cfg.get(
+                                                "surface_planned_recovery_lift_m",
+                                                0.0035,
+                                            )
+                                        )
+                                    elif not force_seat_sp:
+                                        ramp = float(
+                                            np.clip(
+                                                (
+                                                    float(used_sp)
+                                                    - max(seat_frames, 1)
+                                                )
+                                                / max(
+                                                    float(
+                                                        a_cfg.get(
+                                                            "surface_planned_planar_ramp_frames",
+                                                            120,
+                                                        )
+                                                    ),
+                                                    1.0,
+                                                ),
+                                                0.0,
+                                                1.0,
+                                            )
+                                        )
+                                        if float(contact_sp) > float(f_des_step):
+                                            planar_scale = float(
+                                                a_cfg.get(
+                                                    "surface_planned_overload_planar_scale",
+                                                    0.12,
+                                                )
+                                            )
+                                        planar_scale *= max(ramp, 0.08)
+                                    hold_r = (
+                                        tip
+                                        + offset_wt
+                                        + planar * track_use * planar_scale
+                                        + press_use * ax_step
+                                    )
+                                    depth_tip = _priv_tip_surface_depth_m(
+                                        tip, tip_sp0, spiral_n
+                                    )
+                                    press_deep = float(
+                                        a_cfg.get(
+                                            "surface_planned_surface_press_deep_m",
+                                            0.0008,
+                                        )
+                                    )
+                                    if depth_tip < -0.5 * press_deep:
+                                        hold_r = hold_r - spiral_n * min(
+                                            0.0025,
+                                            abs(depth_tip) * 0.55,
+                                        )
+                                    hold_r = _priv_clamp_hold_on_surface(
+                                        hold_r,
+                                        anchor=tip_sp0,
+                                        normal=spiral_n,
+                                        max_lift_m=lift_tol,
+                                    )
+                                    along_slack = float(
+                                        a_cfg.get(
+                                            "surface_planned_along_hold_slack_m",
+                                            0.0025,
+                                        )
+                                    )
+                                    along_now_h = float(feat_i.along_m)
+                                    if along_now_h > along0_spiral + along_slack:
+                                        hole_u_hold = feat_i.hole_axis / (
+                                            np.linalg.norm(feat_i.hole_axis)
+                                            + 1e-12
+                                        )
+                                        excess_a = along_now_h - (
+                                            along0_spiral + along_slack
+                                        )
+                                        hold_r = hold_r - hole_u_hold * min(
+                                            0.0015, 0.35 * excess_a
+                                        )
+                                elif not tip_baseline_mode and bool(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_wrist_ff", False
+                                    )
+                                ):
+                                    hold_r = target + offset_wt + press_use * ax_step
+                                elif not tip_baseline_mode:
+                                    hole_u_cmd = feat_i.hole_axis / (
+                                        np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                    )
+                                    d_xy_only = target - tip
+                                    d_xy_only = d_xy_only - hole_u_cmd * float(
+                                        np.dot(d_xy_only, hole_u_cmd)
+                                    )
+                                    hold_r = (
+                                        tip
+                                        + offset_wt
+                                        + d_xy_only * track_use
+                                        + press_use * ax_step
+                                    )
+                            else:
+                                hold_r = target + offset_wt + press_use * ax_step
                             d_cmd = hold_r - site_xyz
                             dn = float(np.linalg.norm(d_cmd))
                             max_cmd = float(
                                 a_cfg.get("surface_tip_spiral_max_wrist_step_m", 0.008)
                             )
+                            if search_mode == "planned_spiral" and stick_phase == "search":
+                                if micro_lift_left > 0 or planned_stuck or recontact_left > 0:
+                                    max_cmd = float(
+                                        a_cfg.get(
+                                            "surface_planned_stuck_max_wrist_step_m",
+                                            0.003,
+                                        )
+                                    )
+                                else:
+                                    max_cmd = max(
+                                        max_cmd,
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_spiral_max_wrist_step_m",
+                                                0.008,
+                                            )
+                                        ),
+                                    )
+                                    slide_err_m = float(
+                                        a_cfg.get(
+                                            "surface_planned_slide_err_m", 0.003
+                                        )
+                                    )
+                                    if (
+                                        en
+                                        > float(
+                                            a_cfg.get(
+                                                "surface_planned_slide_err_m", 0.003
+                                            )
+                                        )
+                                        and not bool(
+                                            a_cfg.get(
+                                                "surface_planned_spiral_surface_lock",
+                                                True,
+                                            )
+                                        )
+                                    ):
+                                        max_cmd = max(
+                                            max_cmd,
+                                            float(
+                                                a_cfg.get(
+                                                    "surface_planned_slide_max_wrist_step_m",
+                                                    0.010,
+                                                )
+                                            ),
+                                        )
                             if stick_phase == "slide":
                                 max_cmd = max(
                                     max_cmd,
@@ -3306,28 +8813,73 @@ def run_pbvs_biased_surface_press(
                                     ),
                                 )
                             # If tip lags commanded spiral radius, push harder.
+                            # Measure in the spiral contact plane (not peg/hole shaft).
+                            plane_ax = (
+                                spiral_n
+                                if (
+                                    spiral_along_hold
+                                    and search_mode in ("spiral", "planned_spiral")
+                                    and stick_phase == "search"
+                                )
+                                else feat_i.hole_axis
+                            )
                             tip_off_xy = _tip_lat_offset_xy(
-                                tip, spiral_center, feat_i.hole_axis
+                                tip, spiral_center, plane_ax
                             )
                             tip_r_now = float(np.linalg.norm(tip_off_xy))
                             cmd_off = _tip_lat_offset_xy(
-                                target, spiral_center, feat_i.hole_axis
+                                target, spiral_center, plane_ax
                             )
                             cmd_r = float(np.linalg.norm(cmd_off))
-                            if (
-                                search_mode in ("lissajous", *_priv_lat_modes)
-                                or spiral_dir == "inward"
-                            ):
-                                if tip_r_now - cmd_r > 0.003:
-                                    max_cmd = max(
-                                        max_cmd,
-                                        float(
-                                            a_cfg.get(
-                                                "surface_tip_spiral_boost_wrist_step_m",
-                                                0.012,
-                                            )
-                                        ),
+                            # Pull back if tip fled outside spiral; push out if lagging.
+                            # Never boost-yank during stiction micro-lift.
+                            skip_spiral_boost = False
+                            if search_mode == "planned_spiral" and stick_phase == "search":
+                                seat_b = int(
+                                    a_cfg.get(
+                                        "surface_planned_force_seat_frames", 0
                                     )
+                                )
+                                gate_b = float(
+                                    a_cfg.get(
+                                        "surface_planned_planar_force_gate_n",
+                                        0.052,
+                                    )
+                                )
+                                skip_spiral_boost = bool(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_surface_lock",
+                                        True,
+                                    )
+                                ) and (
+                                    (seat_b > 0 and used_sp <= seat_b)
+                                    or float(contact_sp) > gate_b
+                                )
+                            if micro_lift_left > 0 and search_mode == "planned_spiral":
+                                tip_r_now = cmd_r  # skip boost branches
+                            elif skip_spiral_boost:
+                                pass
+                            elif tip_r_now - cmd_r > 0.002:
+                                max_cmd = max(
+                                    max_cmd,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_tip_spiral_boost_wrist_step_m",
+                                            0.012,
+                                        )
+                                    ),
+                                )
+                                # Extra planar pull toward commanded spiral point.
+                                if spiral_track_gate:
+                                    pull = target - tip
+                                    pull = pull - ax_i * float(np.dot(pull, ax_i))
+                                    pn = float(np.linalg.norm(pull))
+                                    if pn > 1e-9:
+                                        hold_r = hold_r + pull * min(1.0, 0.006 / pn)
+                                        d_cmd = hold_r - site_xyz
+                                        dn = float(np.linalg.norm(d_cmd))
+                            elif skip_spiral_boost:
+                                pass
                             elif r_cmd - tip_r_now > 0.003:
                                 max_cmd = max(
                                     max_cmd,
@@ -3338,15 +8890,267 @@ def run_pbvs_biased_surface_press(
                                         )
                                     ),
                                 )
+                            # Type-A LOCAL_RECOVER: stronger wrist step so radial
+                            # ratchet is not stuck behind soft max_cmd (ep08).
+                            if (
+                                tip_star_enable
+                                and tip_hybrid_state.star_mode == "local_recover"
+                                and stick_phase == "search"
+                            ):
+                                max_cmd = max(
+                                    max_cmd,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_tip_star_recover_wrist_step_m",
+                                            a_cfg.get(
+                                                "surface_tip_spiral_boost_wrist_step_m",
+                                                0.012,
+                                            ),
+                                        )
+                                    ),
+                                )
                             if dn > max_cmd > 0.0:
-                                hold_r = site_xyz + d_cmd * (max_cmd / dn)
-                            hold_l[0:3] = site_now[22:25].copy() + d_xy * left_share_sp
+                                # Separate planar vs axial limits so spiral XY chase
+                                # does not dilute the light probe press (ep05 bug).
+                                probe_on = (
+                                    search_mode == "planned_spiral"
+                                    and stick_phase == "search"
+                                    and float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.0
+                                        )
+                                    )
+                                    > 1e-9
+                                )
+                                if probe_on:
+                                    pu = press_use / (
+                                        np.linalg.norm(press_use) + 1e-12
+                                    )
+                                    ax_c = float(np.dot(d_cmd, pu))
+                                    planar_c = d_cmd - pu * ax_c
+                                    pn = float(np.linalg.norm(planar_c))
+                                    if pn > max_cmd > 0.0:
+                                        planar_c = planar_c * (max_cmd / pn)
+                                    ax_cap = float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.00015
+                                        )
+                                    )
+                                    hard_n = float(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_hard_unload_n",
+                                            0.35,
+                                        )
+                                    )
+                                    if float(ax_step) < -1e-12:
+                                        # Probe spiral: never command lift-off.
+                                        ax_c = 0.0
+                                    elif float(contact_sp) > hard_n:
+                                        ax_c = min(ax_c, 0.0)
+                                    else:
+                                        # Reinject probe floor only while seeking.
+                                        ax_want = max(float(ax_step), ax_cap)
+                                        ax_c = float(max(ax_c, ax_want))
+                                        ax_c = float(
+                                            np.clip(ax_c, 0.0, max(ax_want, ax_cap))
+                                        )
+                                    hold_r = site_xyz + planar_c + pu * ax_c
+                                else:
+                                    hold_r = site_xyz + d_cmd * (max_cmd / dn)
+                            elif (
+                                search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                                and float(
+                                    a_cfg.get("surface_planned_probe_press_m", 0.0)
+                                )
+                                > 1e-9
+                                and float(ax_step) >= -1e-12
+                                and float(contact_sp)
+                                <= float(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_hard_unload_n",
+                                        0.35,
+                                    )
+                                )
+                            ):
+                                # dn ≤ max_cmd path: still reinject axial probe.
+                                pu = press_use / (np.linalg.norm(press_use) + 1e-12)
+                                ax_c = float(np.dot(hold_r - site_xyz, pu))
+                                ax_want = max(
+                                    float(ax_step),
+                                    float(
+                                        a_cfg.get(
+                                            "surface_planned_probe_press_m", 0.00015
+                                        )
+                                    ),
+                                )
+                                if ax_c + 1e-9 < ax_want:
+                                    hold_r = hold_r + pu * (ax_want - ax_c)
+                            # Tip-hybrid: reseat press + tip-pivot upright about tip.
+                            if (
+                                tip_hybrid_enable
+                                and search_mode == "planned_spiral"
+                                and stick_phase == "search"
+                            ):
+                                hyb_mode = str(tip_hybrid_state.mode)
+                                pu_h = press_use / (
+                                    np.linalg.norm(press_use) + 1e-12
+                                )
+                                if hyb_mode == "seat":
+                                    seat_press = float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_press_m",
+                                            0.00045,
+                                        )
+                                    )
+                                    planar_h = hold_r - site_xyz
+                                    ax_h = float(np.dot(planar_h, pu_h))
+                                    planar_h = planar_h - pu_h * ax_h
+                                    planar_h *= float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_track", 0.15
+                                        )
+                                    )
+                                    hold_r = (
+                                        site_xyz
+                                        + planar_h
+                                        + pu_h * max(ax_h, seat_press)
+                                    )
+                                elif tip_hybrid_soft_seat:
+                                    soft_press = float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_soft_press_m",
+                                            0.00028,
+                                        )
+                                    )
+                                    ax_h = float(np.dot(hold_r - site_xyz, pu_h))
+                                    if ax_h < soft_press:
+                                        hold_r = hold_r + pu_h * (soft_press - ax_h)
+                                if hyb_mode in ("upright", "spiral"):
+                                    max_ang = float(
+                                        np.radians(
+                                            a_cfg.get(
+                                                "surface_tip_hybrid_upright_step_deg",
+                                                1.2,
+                                            )
+                                        )
+                                    )
+                                    # Full upright while STAR planar-recover / hold-enter
+                                    # (ep02 axis-50° lesson): do not use spiral scale-down.
+                                    star_full_up = bool(
+                                        (
+                                            tip_star_enable
+                                            or tip_slip_enable
+                                        )
+                                        and tip_hybrid_state.star_mode
+                                        in (
+                                            "local_recover",
+                                            "yield_upright",
+                                            "grasp_restore",
+                                        )
+                                    )
+                                    if hyb_mode == "spiral" and not star_full_up:
+                                        max_ang *= float(
+                                            a_cfg.get(
+                                                "surface_tip_hybrid_spiral_orient_scale",
+                                                0.35,
+                                            )
+                                        )
+                                    soft_deg = float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_upright_soft_deg",
+                                            18.0,
+                                        )
+                                    )
+                                    _, axis_err_now, _ = _tip_hole_pose_err(
+                                        tip_ctrl
+                                        if (
+                                            tip_axis_enable
+                                            and tip_theory_ekf is not None
+                                        )
+                                        else tip,
+                                        spiral_center,
+                                        feat_i.hole_axis,
+                                        tip_axis_hat
+                                        if (
+                                            tip_axis_enable
+                                            and tip_axis_hat is not None
+                                        )
+                                        else feat_i.peg_axis,
+                                    )
+                                    if (
+                                        hyb_mode == "upright"
+                                        or star_full_up
+                                        or float(axis_err_now)
+                                        > np.radians(soft_deg) * 0.5
+                                    ):
+                                        d_pos_h, omega_h, _ = tip_pivot_upright(
+                                            site_xyz=site_xyz,
+                                            tip=(
+                                                tip_ctrl
+                                                if (
+                                                    tip_axis_enable
+                                                    and tip_theory_ekf is not None
+                                                )
+                                                else tip
+                                            ),
+                                            peg_axis=(
+                                                tip_axis_hat
+                                                if (
+                                                    tip_axis_enable
+                                                    and tip_axis_hat is not None
+                                                )
+                                                else feat_i.peg_axis
+                                            ),
+                                            hole_axis=feat_i.hole_axis,
+                                            max_ang_rad=max_ang,
+                                        )
+                                        hold_r = hold_r + d_pos_h
+                                        tip_hybrid_omega = omega_h
+                                        if hyb_mode == "upright" or star_full_up:
+                                            # Keep light press while uprighting.
+                                            ax_h = float(
+                                                np.dot(hold_r - site_xyz, pu_h)
+                                            )
+                                            hold_r = hold_r + pu_h * max(
+                                                0.0,
+                                                float(
+                                                    a_cfg.get(
+                                                        "surface_planned_probe_press_m",
+                                                        0.0002,
+                                                    )
+                                                )
+                                                - ax_h,
+                                            )
+                            d_left = d_xy * left_share_sp
+                            if spiral_admit is not None and spiral_left_admit_scale > 0.0:
+                                wr_l_now = read_wrist_wrench_world(raw)
+                                d_adm = spiral_admit.step(
+                                    wr_l_now[1], approach_axis=press_use
+                                ) * spiral_left_admit_scale
+                                # Force-feedback yield only in contact plane (not into/out).
+                                d_adm = d_adm - press_use * float(np.dot(d_adm, press_use))
+                                d_left = d_left + d_adm
+                            # Cap left yield so tray does not run away in one step.
+                            left_cap = float(
+                                a_cfg.get("surface_spiral_left_max_step_m", 0.004)
+                            )
+                            ln = float(np.linalg.norm(d_left))
+                            if ln > left_cap > 0.0:
+                                d_left = d_left * (left_cap / ln)
+                            hold_l[0:3] = site_now[22:25].copy() + d_left
                             cmd = np.zeros(44, dtype=np.float64)
                             cmd[0:6] = site_now[0:6].copy()
                             cmd[0:3] = hold_r
-                            cmd[6:22] = hold_r_hand
+                            if float(np.linalg.norm(tip_hybrid_omega)) > 1e-9:
+                                from scipy.spatial.transform import Rotation as R
+
+                                R_cur = R.from_rotvec(cmd[3:6])
+                                cmd[3:6] = (
+                                    R.from_rotvec(tip_hybrid_omega) * R_cur
+                                ).as_rotvec()
+                            _fill_tip_search_hands(cmd)
                             cmd[22:28] = hold_l
-                            cmd[28:44] = hold_l_hand
                             step_action44(gym_env, cmd, ego_recorder=ego_recorder)
                             feat_after_sp = features_from_raw(raw)
                             tip_a = np.asarray(
@@ -3361,8 +9165,194 @@ def run_pbvs_biased_surface_press(
                                 phase_name = str(search_mode)
                             elif search_mode == "lissajous":
                                 phase_name = "lissajous"
+                            elif search_mode == "planned_spiral":
+                                phase_name = "planned_spiral"
                             else:
                                 phase_name = "spiral"
+                            priv_fn, priv_ncon = _priv_peg_tray_contact_force_n(raw)
+                            priv_mouth_now = False
+                            priv_enter_now = False
+                            priv_along_enter_mm = 0.0
+                            if search_mode == "planned_spiral":
+                                priv_mouth_lat = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_mouth_lat_m",
+                                        mouth_lat * 2.0,
+                                    )
+                                )
+                                priv_enter_lat = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_lat_m",
+                                        mouth_lat,
+                                    )
+                                )
+                                priv_enter_along = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_along_m",
+                                        0.003,
+                                    )
+                                )
+                                priv_mouth_now, priv_enter_now, priv_along_enter_mm = (
+                                    _priv_planned_hole_diag(
+                                        feat_after_sp,
+                                        along0_m=along0_spiral,
+                                        mouth_lat_m=priv_mouth_lat,
+                                        enter_lat_m=priv_enter_lat,
+                                        enter_along_min_m=priv_enter_along,
+                                    )
+                                )
+                                if priv_mouth_now:
+                                    priv_mouth_streak += 1
+                                    priv_at_mouth_peak = True
+                                else:
+                                    priv_mouth_streak = 0
+                                if priv_enter_now:
+                                    priv_enter_streak += 1
+                                else:
+                                    priv_enter_streak = 0
+                                priv_confirm = int(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_confirm", 4
+                                    )
+                                )
+                                if (
+                                    bool(
+                                        a_cfg.get(
+                                            "surface_planned_priv_detect_enable",
+                                            True,
+                                        )
+                                    )
+                                    and priv_enter_streak >= max(1, priv_confirm)
+                                ):
+                                    priv_hole_entered = True
+                                overload_n = float(
+                                    a_cfg.get(
+                                        "surface_planned_force_overload_n", 0.055
+                                    )
+                                )
+                                if float(feat_after_sp.lateral_m) < spiral_lat_min - 0.00025:
+                                    last_lat_improve_sp = used_sp
+                                if float(contact_sp) > overload_n:
+                                    priv_overforce_streak += 1
+                                else:
+                                    priv_overforce_streak = 0
+                                priv_overforce_streak_peak = max(
+                                    priv_overforce_streak_peak, priv_overforce_streak
+                                )
+                                priv_along_drift_peak_m = max(
+                                    priv_along_drift_peak_m,
+                                    max(
+                                        0.0,
+                                        float(feat_after_sp.along_m) - along0_spiral,
+                                    ),
+                                )
+                                over_need = int(
+                                    a_cfg.get(
+                                        "surface_planned_priv_overforce_frames", 12
+                                    )
+                                )
+                                lat_stall_need = int(
+                                    a_cfg.get(
+                                        "surface_planned_priv_lat_stall_frames",
+                                        180,
+                                    )
+                                )
+                                drift_lim = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_along_drift_abort_m",
+                                        0.006,
+                                    )
+                                )
+                                lat_stall = used_sp - last_lat_improve_sp
+                                if (
+                                    bool(
+                                        a_cfg.get(
+                                            "surface_planned_priv_guard_abort", True
+                                        )
+                                    )
+                                    and used_sp
+                                    > int(
+                                        a_cfg.get(
+                                            "surface_planned_spiral_grace_frames", 45
+                                        )
+                                    )
+                                    and priv_overforce_streak >= over_need
+                                    and lat_stall >= lat_stall_need
+                                    and spiral_lat_min
+                                    > float(
+                                        a_cfg.get(
+                                            "surface_planned_priv_mouth_lat_m",
+                                            0.008,
+                                        )
+                                    )
+                                    # Probe spiral: ConnTact stays in contact; do not
+                                    # abort on mild residual (ep01 stopped at 0.16N).
+                                    and not (
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_probe_press_m", 0.0
+                                            )
+                                        )
+                                        > 1e-9
+                                        and bool(
+                                            a_cfg.get(
+                                                "surface_planned_probe_ignore_overforce_abort",
+                                                True,
+                                            )
+                                        )
+                                    )
+                                ):
+                                    spiral_reason = "priv_overforce"
+                                    print(
+                                        f"pci: PRIV abort overforce |r|="
+                                        f"{contact_sp:.2f}N>{overload_n:.2f}N "
+                                        f"streak={priv_overforce_streak} "
+                                        f"lat_stall={lat_stall} "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                                if (
+                                    bool(
+                                        a_cfg.get(
+                                            "surface_planned_priv_guard_abort", True
+                                        )
+                                    )
+                                    and priv_along_drift_peak_m > drift_lim
+                                    # Probe spiral: along wobble under stiction is not
+                                    # tip flyaway — ep01 aborted at +8mm while |r|~2N.
+                                    and not (
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_probe_press_m", 0.0
+                                            )
+                                        )
+                                        > 1e-9
+                                        and bool(
+                                            a_cfg.get(
+                                                "surface_planned_probe_ignore_along_drift_abort",
+                                                True,
+                                            )
+                                        )
+                                    )
+                                ):
+                                    spiral_reason = "priv_along_drift"
+                                    print(
+                                        f"pci: PRIV abort along drift "
+                                        f"{priv_along_drift_peak_m*1e3:.1f}mm "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                            wr_abs = read_wrist_wrench_world(raw)
+                            f_abs = float(
+                                __import__("numpy").linalg.norm(
+                                    __import__("numpy").asarray(
+                                        wr_abs[0][:3], dtype=__import__("numpy").float64
+                                    )
+                                )
+                            )
+                            _slip_mm_log = float(_update_grasp_slip()) * 1000.0
                             force_trace.append(
                                 {
                                     "t": float(t_force) * dt_f,
@@ -3372,6 +9362,32 @@ def run_pbvs_biased_surface_press(
                                     "resid_l": float(left_c),
                                     "fz_r": float(fz_r),
                                     "fz_l": float(fz_l),
+                                    "f_abs_r": float(f_abs),
+                                    "priv_peg_tray_fn": float(priv_fn),
+                                    "priv_peg_tray_ncon": float(priv_ncon),
+                                    "priv_at_mouth": int(priv_mouth_now),
+                                    "priv_hole_entered": int(priv_enter_now),
+                                    "priv_along_enter_mm": float(
+                                        priv_along_enter_mm
+                                    )
+                                    * 1000.0,
+                                    "priv_depth_mm": float(
+                                        _priv_tip_surface_depth_m(
+                                            tip_a, tip_sp0, spiral_n
+                                        )
+                                    )
+                                    * 1000.0
+                                    if search_mode == "planned_spiral"
+                                    else 0.0,
+                                    "priv_planar_mm": float(
+                                        feat_after_sp.lateral_m
+                                    )
+                                    * 1000.0
+                                    if search_mode == "planned_spiral"
+                                    else 0.0,
+                                    "tip_track_err_mm": float(en) * 1000.0
+                                    if search_mode == "planned_spiral"
+                                    else 0.0,
                                     "lat_mm": float(feat_after_sp.lateral_m) * 1000.0,
                                     "along_mm": float(feat_after_sp.along_m) * 1000.0,
                                     "f_des": float(f_des_step),
@@ -3380,14 +9396,42 @@ def run_pbvs_biased_surface_press(
                                     "spiral_r_mm": float(r_cmd) * 1000.0,
                                     "spiral_theta": float(theta_sp),
                                     "stick": int(stick_active),
-                                    "stick_lift_mm": float(np.linalg.norm(d_stick))
-                                    * 1000.0,
+                                    "stick_phase": str(stick_phase),
+                                    "stick_hop": int(stick_hop_count),
+                                    "stick_lift_mm": float(
+                                        abs(float(np.dot(d_stick, press_ax)))
+                                    )
+                                    * 1000.0
+                                    if stick_active
+                                    else 0.0,
                                     "liss_ax_mm": float(ax_j) * 1000.0
                                     if search_mode == "lissajous"
                                     else 0.0,
                                     "liss_ay_mm": float(ay_j) * 1000.0
                                     if search_mode == "lissajous"
                                     else 0.0,
+                                    "bl_path": str(_bl_meta.get("path", "")),
+                                    "bl_tip_err_mm": float(
+                                        _bl_meta.get("tip_err_mm", 0.0)
+                                    ),
+                                    "bl_alpha": float(_bl_meta.get("alpha", 0.0)),
+                                    "bl_C_trace": float(
+                                        _bl_meta.get("C_trace", 0.0)
+                                    ),
+                                    "bl_ax_step_mm": float(ax_step) * 1000.0,
+                                    "bl_force_scale": float(
+                                        _bl_meta.get("force_scale", 1.0)
+                                    ),
+                                    "grasp_slip_mm": _slip_mm_log,
+                                    "tip_spiral_err_mm": float(
+                                        abs(float(r_cmd) - float(tip_xy))
+                                    )
+                                    * 1000.0,
+                                    "force_hole_entered": int(
+                                        force_hole_state.entered
+                                        if force_hole_detect
+                                        else 0
+                                    ),
                                 }
                             )
                             t_force += 1
@@ -3399,30 +9443,515 @@ def run_pbvs_biased_surface_press(
                             spiral_lat_min = min(
                                 spiral_lat_min, float(feat_after_sp.lateral_m)
                             )
+                            # Tip seat / axis telemetry (privileged audit only).
+                            tip_now_sp = np.asarray(
+                                feat_after_sp.tip_pos, dtype=np.float64
+                            ).reshape(3)
+                            float_m = max(
+                                0.0,
+                                _priv_tip_surface_depth_m(
+                                    tip_now_sp, tip_sp0, spiral_n
+                                ),
+                            )
+                            spiral_tip_float_peak_m = max(
+                                spiral_tip_float_peak_m, float(float_m)
+                            )
+                            spiral_axis_err_peak_deg = max(
+                                spiral_axis_err_peak_deg,
+                                float(np.degrees(feat_after_sp.axis_error_rad)),
+                            )
+                            spiral_contact_frames += 1
+                            if float(contact_sp) >= seat_contact_n:
+                                spiral_contact_ok_n += 1
                             out_i = env._labeler.compute(raw)
                             if _grasp_lost():
-                                spiral_reason = "grasp_slip"
-                                print(
-                                    f"pci: tip-spiral ABORT grasp_slip="
-                                    f"{grasp_slip_peak*1e3:.1f}mm "
-                                    f"> {grasp_slip_lim*1e3:.1f}mm j={used_sp}",
-                                    flush=True,
+                                # Planned spiral: tip-tracking mode expects peel;
+                                # never abort mid-search on slip meter (ep09).
+                                hard_slip = float(
+                                    a_cfg.get(
+                                        "surface_planned_grasp_slip_hard_m",
+                                        max(grasp_slip_lim * 1.5, 0.12),
+                                    )
                                 )
-                                meta["grasp_abort_phase"] = "spiral"
-                                break
-                            if (not out_i.tray_ok) or tilt_i > max_tilt_sp:
-                                spiral_reason = "spiral_tilt_or_tray"
+                                if search_mode == "planned_spiral":
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: planned continue despite slip="
+                                            f"{grasp_slip_peak*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                elif grasp_slip_peak <= hard_slip:
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: continue despite slip="
+                                            f"{grasp_slip_peak*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                else:
+                                    spiral_reason = "grasp_slip"
+                                    print(
+                                        f"pci: tip-spiral ABORT grasp_slip="
+                                        f"{grasp_slip_peak*1e3:.1f}mm "
+                                        f"> {grasp_slip_lim*1e3:.1f}mm j={used_sp}",
+                                        flush=True,
+                                    )
+                                    meta["grasp_abort_phase"] = "spiral"
+                                    break
+                            tilt_hard = float(
+                                a_cfg.get(
+                                    "surface_planned_spiral_max_tilt_hard_deg",
+                                    max(max_tilt_sp * 2.0, 18.0),
+                                )
+                            )
+                            if not out_i.tray_ok:
+                                # Tray contact label flickers under slip/tilt; do not
+                                # kill planned tip spiral (ep02/08/10 tray_ok=0 abort).
+                                if search_mode in ("planned_spiral", "franka_spiral"):
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: planned continue despite "
+                                            f"tray_ok=0 j={used_sp}",
+                                            flush=True,
+                                        )
+                                else:
+                                    spiral_reason = "spiral_tilt_or_tray"
+                                    print(
+                                        f"pci: tip-spiral abort tray_ok=0 j={used_sp}",
+                                        flush=True,
+                                    )
+                                    break
+                            if tilt_i > max_tilt_sp:
+                                if (
+                                    search_mode
+                                    in ("planned_spiral", "franka_spiral")
+                                    and tilt_i <= tilt_hard
+                                ):
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: planned continue despite tilt="
+                                            f"{tilt_i:.1f}deg "
+                                            f"(soft={max_tilt_sp:.1f} "
+                                            f"hard={tilt_hard:.1f}) j={used_sp}",
+                                            flush=True,
+                                        )
+                                else:
+                                    spiral_reason = "spiral_tilt_or_tray"
+                                    print(
+                                        f"pci: tip-spiral abort tilt={tilt_i:.1f}deg "
+                                        f"tray_ok={int(bool(out_i.tray_ok))} j={used_sp}",
+                                        flush=True,
+                                    )
+                                    break
+                            if (
+                                search_mode == "planned_spiral"
+                                and force_hole_detect
+                                and force_hole_state.entered
+                                and bool(
+                                    a_cfg.get(
+                                        "surface_planned_force_stop_on_hole", True
+                                    )
+                                )
+                            ):
+                                # Tip-STAR / ours v11: hold stop until axis upright
+                                # (STAR smoke ep02: mouth reach + axis~50° reject).
+                                hold_until_up = bool(
+                                    (
+                                        (
+                                            tip_star_enable
+                                            or deploy_mouth_enter
+                                        )
+                                        and a_cfg.get(
+                                            "surface_tip_star_hold_enter_until_upright",
+                                            True,
+                                        )
+                                    )
+                                    or (
+                                        tip_phig_enable
+                                        and bool(
+                                            a_cfg.get(
+                                                "surface_tip_phig_hold_enter", True
+                                            )
+                                        )
+                                    )
+                                )
+                                axis_now_deg = float(
+                                    np.degrees(
+                                        float(
+                                            getattr(
+                                                feat_after_sp,
+                                                "axis_error_rad",
+                                                0.0,
+                                            )
+                                        )
+                                    )
+                                )
+                                max_axis_hold = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_max_axis_err_deg",
+                                        25.0,
+                                    )
+                                )
+                                # Type-A / STAR: hold to soft upright (stricter than
+                                # audit 25°) so ep02 cannot stop near mouth then tip
+                                # to ~40–50° before GATE.
+                                if tip_star_enable and bool(
+                                    a_cfg.get(
+                                        "surface_tip_star_hold_enter_until_upright",
+                                        True,
+                                    )
+                                ):
+                                    soft_hold = float(
+                                        a_cfg.get(
+                                            "surface_tip_star_hold_enter_max_axis_deg",
+                                            a_cfg.get(
+                                                "surface_tip_hybrid_upright_soft_deg",
+                                                18.0,
+                                            ),
+                                        )
+                                    )
+                                    max_axis_hold = min(max_axis_hold, soft_hold)
+                                # Agent-D oracle v2: also hold until along seat
+                                # (ep07 force_hole_along_reject ~234mm float).
+                                hold_oracle_seat = bool(
+                                    tip_oracle_enable
+                                    and a_cfg.get(
+                                        "surface_tip_oracle_hold_enter_seat", True
+                                    )
+                                )
+                                # Track-B PHIG: same seat/axis hold, deployable cues only.
+                                hold_phig_seat = bool(
+                                    tip_phig_enable
+                                    and a_cfg.get("surface_tip_phig_hold_enter", True)
+                                )
+                                along_now_h = float(feat_after_sp.along_m)
+                                tip_now_h = float(feat_after_sp.tip_socket_dist_m)
+                                max_along_h = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_max_along_m",
+                                        0.100,
+                                    )
+                                )
+                                tip_in_bore_h = tip_now_h <= float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_tip_m", 0.095
+                                    )
+                                ) or along_now_h <= float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_along_m", 0.095
+                                    )
+                                )
+                                along_ok_h = tip_in_bore_h or along_now_h <= max_along_h
+                                axis_ok_h = axis_now_deg <= max_axis_hold
+                                hold_confirm_n = int(
+                                    a_cfg.get(
+                                        "surface_tip_star_hold_enter_confirm", 4
+                                    )
+                                )
+                                need_hold_up = bool(hold_until_up) and (
+                                    axis_now_deg > max_axis_hold
+                                    or int(tip_hybrid_state.upright_ok_streak)
+                                    < hold_confirm_n
+                                )
+                                if need_hold_up:
+                                    tip_hybrid_state.mode = "upright"
+                                    if axis_now_deg > max_axis_hold:
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                    tip_hybrid_state.star_mode = "yield_upright"
+                                    tip_star_counts["hold_enter_upright"] = (
+                                        tip_star_counts.get("hold_enter_upright", 0)
+                                        + 1
+                                    )
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: FORCE hole cue held for upright "
+                                            f"axis={axis_now_deg:.1f}>{max_axis_hold:.1f}deg "
+                                            f"streak={int(tip_hybrid_state.upright_ok_streak)}/"
+                                            f"{hold_confirm_n} "
+                                            f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                elif hold_oracle_seat and (
+                                    (not along_ok_h) or (not axis_ok_h)
+                                ):
+                                    if not along_ok_h:
+                                        tip_hybrid_state.mode = "seat"
+                                        tip_hybrid_state.seat_ok_streak = 0
+                                        tip_hybrid_state.oracle_reseat_left = max(
+                                            int(tip_hybrid_state.oracle_reseat_left),
+                                            int(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_reseat_frames",
+                                                    40,
+                                                )
+                                            )
+                                            // 2,
+                                        )
+                                    else:
+                                        tip_hybrid_state.mode = "upright"
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: ORACLE hole cue held for seat "
+                                            f"along={along_now_h*1e3:.1f}mm "
+                                            f"axis={axis_now_deg:.1f}deg "
+                                            f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                elif hold_phig_seat and (
+                                    (not along_ok_h) or (not axis_ok_h)
+                                ):
+                                    if not along_ok_h:
+                                        tip_hybrid_state.mode = "seat"
+                                        tip_hybrid_state.seat_ok_streak = 0
+                                        phig_state.mode = "slip_reseat"
+                                        phig_state.reseat_left = max(
+                                            int(phig_state.reseat_left),
+                                            int(phig_cfg.reseat_frames) // 2,
+                                        )
+                                    else:
+                                        tip_hybrid_state.mode = "upright"
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                        phig_state.mode = "enter_hold"
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: PHIG hole cue held for seat "
+                                            f"along={along_now_h*1e3:.1f}mm "
+                                            f"axis={axis_now_deg:.1f}deg "
+                                            f"r_cmd="
+                                            f"{(float(planned_rs[planned_i]) if planned_rs is not None else -1)*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                else:
+                                    spiral_reason = "hole_detected"
+                                    print(
+                                        f"pci: FORCE hole-enter stop lat="
+                                        f"{feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"|r|={contact_sp:.2f}N i={planned_i}",
+                                        flush=True,
+                                    )
+                                    break
+                            if (
+                                conntact_faithful
+                                and conntact_height_enter
+                                and conntact_surface_h is not None
+                            ):
+                                tip_h = float(
+                                    np.asarray(
+                                        feat_after_sp.tip_pos, dtype=np.float64
+                                    ).reshape(3)[2]
+                                )
+                                if height_drop_enter(
+                                    tip_h,
+                                    float(conntact_surface_h),
+                                    drop_m=float(conntact_params.height_drop_m),
+                                ):
+                                    force_hole_state.entered = True
+                                    spiral_reason = "hole_detected"
+                                    print(
+                                        f"pci: ConnTact height-drop enter "
+                                        f"z={tip_h:.5f} surf={conntact_surface_h:.5f} "
+                                        f"drop≥{conntact_params.height_drop_m*1e3:.2f}mm "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"j={used_sp}",
+                                        flush=True,
+                                    )
+                                    break
+                            if (
+                                franka_faithful
+                                and franka_height_enter
+                                and franka_surface_h is not None
+                            ):
+                                tip_h = float(
+                                    np.asarray(
+                                        feat_after_sp.tip_pos, dtype=np.float64
+                                    ).reshape(3)[2]
+                                )
+                                if franka_height_drop_enter(
+                                    tip_h,
+                                    float(franka_surface_h),
+                                    drop_m=float(franka_params.height_drop_m),
+                                ):
+                                    force_hole_state.entered = True
+                                    spiral_reason = "hole_detected"
+                                    print(
+                                        f"pci: Franka height-drop enter "
+                                        f"z={tip_h:.5f} surf={franka_surface_h:.5f} "
+                                        f"drop≥{franka_params.height_drop_m*1e3:.2f}mm "
+                                        f"jam_step={franka_state.spiral_step} "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"j={used_sp}",
+                                        flush=True,
+                                    )
+                                    break
+                            if (
+                                psft_faithful
+                                and psft_height_enter
+                                and psft_surface_h is not None
+                            ):
+                                tip_h = float(
+                                    np.asarray(
+                                        feat_after_sp.tip_pos, dtype=np.float64
+                                    ).reshape(3)[2]
+                                )
+                                if psft_height_drop_enter(
+                                    tip_h,
+                                    float(psft_surface_h),
+                                    drop_m=float(psft_params.height_drop_m),
+                                ):
+                                    force_hole_state.entered = True
+                                    spiral_reason = "hole_detected"
+                                    print(
+                                        f"pci: PSFT height-drop enter "
+                                        f"z={tip_h:.5f} surf={psft_surface_h:.5f} "
+                                        f"drop≥{psft_params.height_drop_m*1e3:.2f}mm "
+                                        f"r={psft_state.r_m*1e3:.1f}mm "
+                                        f"θ={psft_state.theta_rad:.2f} "
+                                        f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                        f"j={used_sp}",
+                                        flush=True,
+                                    )
+                                    break
+                            if (
+                                search_mode == "planned_spiral"
+                                and priv_hole_entered
+                                and bool(
+                                    a_cfg.get(
+                                        "surface_planned_priv_stop_on_enter", True
+                                    )
+                                )
+                                and not (
+                                    force_hole_detect
+                                    and bool(
+                                        a_cfg.get(
+                                            "surface_planned_force_hole_only", True
+                                        )
+                                    )
+                                )
+                            ):
+                                spiral_reason = "priv_hole_entered"
                                 print(
-                                    f"pci: tip-spiral abort tilt={tilt_i:.1f}deg "
-                                    f"tray_ok={int(bool(out_i.tray_ok))} j={used_sp}",
+                                    f"pci: PRIV hole-enter lat="
+                                    f"{feat_after_sp.lateral_m*1e3:.1f}mm "
+                                    f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                    f"enter={priv_along_enter_mm*1e3:.1f}mm "
+                                    f"|r|={contact_sp:.2f}N priv_fn={priv_fn:.3f} "
+                                    f"i={planned_i}",
                                     flush=True,
                                 )
                                 break
                             if (
-                                float(feat_after_sp.lateral_m) <= mouth_lat
-                                and float(feat_after_sp.along_m) <= 0.105
+                                search_mode == "planned_spiral"
+                                and planned_wps is not None
+                                and planned_i >= planned_wps.shape[0] - 1
+                                and float(np.linalg.norm(planned_wps[-1] - tip_a))
+                                <= float(a_cfg.get("surface_planned_spiral_catch_m", 0.003))
                             ):
-                                if mouth_continue:
+                                spiral_reason = "planned_spiral_done"
+                                print(
+                                    f"pci: planned-spiral done "
+                                    f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                    f"along={feat_after_sp.along_m*1e3:.1f}mm "
+                                    f"i={planned_i}/{planned_wps.shape[0]}",
+                                    flush=True,
+                                )
+                                break
+                            if float(feat_after_sp.lateral_m) <= mouth_lat:
+                                # Tip at mouth radius: stop and mouth-probe.
+                                # Keep threshold = mouth (not 1.5x) so we do not probe
+                                # beside the hole (v2 false force / audit rejects).
+                                # Agent-D oracle: if floated (no contact), keep tip→mouth
+                                # + reseat instead of entering mouth-probe (ep08 flyaway).
+                                oracle_need_seat = bool(
+                                    tip_oracle_enable
+                                    and float(contact_sp)
+                                    < float(
+                                        a_cfg.get(
+                                            "surface_tip_hybrid_seat_contact_n", 0.05
+                                        )
+                                    )
+                                    * 0.5
+                                )
+                                # Oracle: already tip-in-bore under SUCCESS_STANDARD →
+                                # accept without mouth-probe (ep08 along~91 then flew).
+                                if tip_oracle_enable:
+                                    along_nm = float(feat_after_sp.along_m)
+                                    tip_nm = float(feat_after_sp.tip_socket_dist_m)
+                                    axis_nm = float(
+                                        np.degrees(
+                                            float(feat_after_sp.axis_error_rad)
+                                        )
+                                    )
+                                    tip_bore_nm = tip_nm <= float(
+                                        a_cfg.get(
+                                            "surface_planned_priv_enter_tip_m",
+                                            0.095,
+                                        )
+                                    ) or along_nm <= float(
+                                        a_cfg.get(
+                                            "surface_planned_priv_enter_along_m",
+                                            0.095,
+                                        )
+                                    )
+                                    axis_ok_nm = axis_nm <= float(
+                                        a_cfg.get(
+                                            "surface_planned_priv_enter_max_axis_err_deg",
+                                            25.0,
+                                        )
+                                    )
+                                    if tip_bore_nm and axis_ok_nm:
+                                        force_hole_state.entered = True
+                                        spiral_reason = "hole_detected"
+                                        print(
+                                            f"pci: ORACLE tip-in-bore enter "
+                                            f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                            f"along={along_nm*1e3:.1f}mm "
+                                            f"axis={axis_nm:.1f}deg "
+                                            f"|r|={contact_sp:.3f}N j={used_sp}",
+                                            flush=True,
+                                        )
+                                        break
+                                    if tip_bore_nm and (not axis_ok_nm):
+                                        tip_hybrid_state.mode = "upright"
+                                        tip_hybrid_state.upright_ok_streak = 0
+                                        if used_sp % 30 == 0:
+                                            print(
+                                                f"pci: ORACLE tip-in-bore hold upright "
+                                                f"axis={axis_nm:.1f}deg "
+                                                f"along={along_nm*1e3:.1f}mm "
+                                                f"j={used_sp}",
+                                                flush=True,
+                                            )
+                                        # Do not mouth-probe while tilted.
+                                        continue
+                                if oracle_need_seat:
+                                    tip_hybrid_state.oracle_reseat_left = max(
+                                        int(tip_hybrid_state.oracle_reseat_left),
+                                        int(
+                                            a_cfg.get(
+                                                "surface_tip_oracle_reseat_frames",
+                                                40,
+                                            )
+                                        )
+                                        // 2,
+                                    )
+                                    if used_sp % 30 == 0:
+                                        print(
+                                            f"pci: ORACLE near mouth but float "
+                                            f"|r|={contact_sp:.3f}N — reseat "
+                                            f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
+                                            f"j={used_sp}",
+                                            flush=True,
+                                        )
+                                elif mouth_continue and search_mode != "planned_spiral":
                                     if used_sp == 1 or used_sp % 30 == 0:
                                         print(
                                             f"pci: near mouth continue search "
@@ -3438,6 +9967,82 @@ def run_pbvs_biased_surface_press(
                                         f"lat={feat_after_sp.lateral_m*1e3:.1f}mm "
                                         f"along={feat_after_sp.along_m*1e3:.1f}mm "
                                         f"|r|={contact_sp:.2f}N tip_xy={tip_xy*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                    break
+                            # Deployable mouth yield (optional). Default OFF — premature
+                            # ρ-to-planner-center yield aborted healthy Tip-Hybrid
+                            # spirals and false-fired mouth-probe (ep01/03).
+                            if (
+                                deploy_mouth_enter
+                                and bool(
+                                    a_cfg.get(
+                                        "surface_deploy_mouth_yield_spiral", False
+                                    )
+                                )
+                                and search_mode == "planned_spiral"
+                                and (not force_hole_state.entered)
+                            ):
+                                tip_a_dm = np.asarray(
+                                    feat_after_sp.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                tip_off_dm = _tip_lat_offset_xy(
+                                    tip_a_dm, spiral_center, spiral_n
+                                )
+                                tip_rho_dm = float(np.linalg.norm(tip_off_dm))
+                                e_dm = target - tip_a_dm
+                                e_dm = e_dm - spiral_n * float(
+                                    np.dot(e_dm, spiral_n)
+                                )
+                                tip_err_dm = float(np.linalg.norm(e_dm))
+                                seat_n_dm = float(
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    )
+                                )
+                                if (
+                                    float(contact_sp) >= seat_n_dm * 0.5
+                                    and deploy_mouth_yield_cue(
+                                        r_cmd_m=float(r_cmd),
+                                        tip_rho_m=tip_rho_dm,
+                                        tip_err_m=tip_err_dm,
+                                        mouth_m=float(mouth_lat),
+                                        tip_err_near_m=float(
+                                            a_cfg.get(
+                                                "surface_deploy_mouth_yield_err_m",
+                                                0.004,
+                                            )
+                                        ),
+                                        contact_resid_n=float(contact_sp),
+                                        peak_contact_resid_n=float(
+                                            force_hole_state.peak_contact_resid
+                                        ),
+                                        resid_dip_n=float(
+                                            a_cfg.get(
+                                                "surface_deploy_mouth_resid_dip_n",
+                                                0.05,
+                                            )
+                                        ),
+                                        seat_contact_n=seat_n_dm,
+                                        allow_resid_dip=bool(
+                                            a_cfg.get(
+                                                "surface_deploy_mouth_allow_resid_dip",
+                                                False,
+                                            )
+                                        ),
+                                    )
+                                ):
+                                    spiral_reason = "near_mouth"
+                                    tip_star_counts["yield_mouth"] = (
+                                        tip_star_counts.get("yield_mouth", 0) + 1
+                                    )
+                                    print(
+                                        f"pci: deploy-mouth yield "
+                                        f"r={float(r_cmd)*1e3:.1f}mm "
+                                        f"ρ={tip_rho_dm*1e3:.1f}mm "
+                                        f"err={tip_err_dm*1e3:.1f}mm "
+                                        f"|r|={contact_sp:.2f}N "
+                                        f"→ SEAT+mouth-probe",
                                         flush=True,
                                     )
                                     break
@@ -3483,6 +10088,21 @@ def run_pbvs_biased_surface_press(
                                 spiral_reason == "near_mouth"
                                 or bool(stick_reached_mouth)
                                 or float(feat_m0.lateral_m) <= mouth_lat * 2.5
+                                or (
+                                    search_mode == "planned_spiral"
+                                    and spiral_reason
+                                    in (
+                                        "priv_overforce",
+                                        "spiral_timeout",
+                                        "planned_spiral_done",
+                                    )
+                                    and float(feat_m0.lateral_m)
+                                    <= float(
+                                        a_cfg.get(
+                                            "surface_mouth_fallback_lat_m", 0.028
+                                        )
+                                    )
+                                )
                             )
                             if run_mouth and n_mouth > 0:
                                 mouth_wiggle_reason = "run"
@@ -3740,9 +10360,8 @@ def run_pbvs_biased_surface_press(
                                     cmd = np.zeros(44, dtype=np.float64)
                                     cmd[0:6] = site_now[0:6].copy()
                                     cmd[0:3] = hold_r
-                                    cmd[6:22] = hold_r_hand
+                                    _fill_tip_search_hands(cmd)
                                     cmd[22:28] = hold_l
-                                    cmd[28:44] = hold_l_hand
                                     step_action44(
                                         gym_env, cmd, ego_recorder=ego_recorder
                                     )
@@ -3878,10 +10497,12 @@ def run_pbvs_biased_surface_press(
                         meta["mouth_wiggle_reason"] = str(mouth_wiggle_reason)
                         meta["mouth_tip_xy_peak_mm"] = float(mouth_tip_xy_peak) * 1000.0
                         meta["priv_lat_along_hold"] = bool(priv_lat_along_hold)
+                        meta["spiral_along_hold"] = bool(spiral_along_hold)
                         meta["priv_lat_stick_enable"] = bool(stick_enable)
                         meta["priv_lat_stick_frames"] = int(stick_count)
                         meta["priv_lat_stick_phase"] = str(stick_phase)
                         meta["stick_reached_mouth"] = bool(stick_reached_mouth)
+                        meta["stick_hop_count"] = int(stick_hop_count)
                         if along_hold_m is not None:
                             meta["priv_lat_along_hold_m"] = float(along_hold_m)
                         if mouth_wiggle_reason == "grasp_slip":
@@ -3903,8 +10524,251 @@ def run_pbvs_biased_surface_press(
                         meta["phase_a_rel_rot_peak_rad"] = float(phase_a_rel_peak)
                         meta["spiral_frames"] = int(used_sp)
                         meta["spiral_reason"] = str(spiral_reason)
+                        meta["priv_planned_hole_entered"] = bool(priv_hole_entered)
+                        meta["force_planned_hole_entered"] = bool(
+                            (
+                                force_hole_state.entered
+                                if (
+                                    force_hole_detect
+                                    or conntact_faithful
+                                    or franka_faithful
+                                    or psft_faithful
+                                )
+                                else False
+                            )
+                        )
+                        if conntact_faithful:
+                            meta["conntact_faithful"] = True
+                            meta["conntact_height_enter"] = bool(
+                                spiral_reason == "hole_detected"
+                                and force_hole_state.entered
+                            )
+                            meta["conntact_surface_z"] = (
+                                float(conntact_surface_h)
+                                if conntact_surface_h is not None
+                                else None
+                            )
+                        if franka_faithful:
+                            meta["franka_faithful"] = True
+                            meta["franka_height_enter"] = bool(
+                                spiral_reason == "hole_detected"
+                                and force_hole_state.entered
+                            )
+                            meta["franka_spiral_step"] = int(franka_state.spiral_step)
+                            meta["franka_surface_z"] = (
+                                float(franka_surface_h)
+                                if franka_surface_h is not None
+                                else None
+                            )
+                        if psft_faithful:
+                            meta["psft_faithful"] = True
+                            meta["psft_paper_reimpl"] = True
+                            meta["psft_no_official_code"] = True
+                            meta["psft_height_enter"] = bool(
+                                spiral_reason == "hole_detected"
+                                and force_hole_state.entered
+                            )
+                            meta["psft_r_m"] = float(psft_state.r_m)
+                            meta["psft_theta_rad"] = float(psft_state.theta_rad)
+                            meta["psft_step"] = int(psft_state.step)
+                            meta["psft_surface_z"] = (
+                                float(psft_surface_h)
+                                if psft_surface_h is not None
+                                else None
+                            )
+                            meta["franka_last"] = dict(franka_meta_last)
+                        meta["priv_planned_at_mouth"] = bool(priv_at_mouth_peak)
+                        meta["priv_planned_overforce_streak_peak"] = int(
+                            priv_overforce_streak_peak
+                        )
+                        meta["priv_planned_along_drift_peak_mm"] = float(
+                            priv_along_drift_peak_m
+                        ) * 1000.0
                         meta["spiral_lat_min_mm"] = float(spiral_lat_min) * 1000
                         meta["spiral_resid_peak_n"] = float(spiral_resid_peak)
+                        meta["spiral_tip_float_peak_m"] = float(spiral_tip_float_peak_m)
+                        meta["spiral_axis_err_peak_deg"] = float(
+                            spiral_axis_err_peak_deg
+                        )
+                        meta["spiral_contact_ok_n"] = int(spiral_contact_ok_n)
+                        meta["spiral_contact_frames"] = int(spiral_contact_frames)
+                        meta["spiral_contact_frac"] = float(
+                            spiral_contact_ok_n / max(spiral_contact_frames, 1)
+                        )
+                        meta["tip_hybrid_enable"] = bool(tip_hybrid_enable)
+                        meta["tip_hybrid_mode_final"] = str(tip_hybrid_state.mode)
+                        meta["tip_hybrid_seat_frames"] = int(
+                            tip_hybrid_mode_counts.get("seat", 0)
+                        )
+                        meta["tip_hybrid_upright_frames"] = int(
+                            tip_hybrid_mode_counts.get("upright", 0)
+                        )
+                        meta["tip_hybrid_spiral_frames"] = int(
+                            tip_hybrid_mode_counts.get("spiral", 0)
+                        )
+                        meta["tip_msar_enable"] = bool(tip_msar_enable)
+                        meta["tip_msar_mode_final"] = str(
+                            tip_hybrid_state.msar_mode
+                        )
+                        meta["tip_msar_mouth_seek_frames"] = int(
+                            tip_msar_counts.get("mouth_seek", 0)
+                        )
+                        meta["tip_msar_slip_reseat_frames"] = int(
+                            tip_msar_counts.get("slip_reseat", 0)
+                        )
+                        meta["tip_msar_spiral_track_frames"] = int(
+                            tip_msar_counts.get("spiral_track", 0)
+                        )
+                        meta["tip_star_enable"] = bool(tip_star_enable)
+                        meta["tip_slip_enable"] = bool(tip_slip_enable)
+                        meta["tip_star_mode_final"] = str(tip_hybrid_state.star_mode)
+                        meta["tip_star_local_recover_frames"] = int(
+                            tip_star_counts.get("local_recover", 0)
+                        )
+                        meta["tip_star_grasp_restore_frames"] = int(
+                            tip_star_counts.get("grasp_restore", 0)
+                        )
+                        meta["tip_slip_grasp_restore_frames"] = int(
+                            tip_star_counts.get("grasp_restore", 0)
+                        )
+                        meta["tip_star_yield_mouth_frames"] = int(
+                            tip_star_counts.get("yield_mouth", 0)
+                        )
+                        meta["tip_star_yield_upright_frames"] = int(
+                            tip_star_counts.get("yield_upright", 0)
+                        )
+                        meta["tip_star_hold_enter_upright_frames"] = int(
+                            tip_star_counts.get("hold_enter_upright", 0)
+                        )
+                        meta["tip_star_spiral_track_frames"] = int(
+                            tip_star_counts.get("spiral_track", 0)
+                        )
+                        meta["tip_star_grasp_boosted"] = bool(
+                            tip_hybrid_state.star_grasp_boosted
+                        )
+                        meta["tip_slip_grasp_boosted"] = bool(
+                            tip_hybrid_state.star_grasp_boosted
+                        )
+                        if "tip_slip_hand_mean_abs_before" not in meta:
+                            meta["tip_slip_hand_mean_abs_before"] = float(
+                                tip_hybrid_state.star_grasp_mean_abs_before
+                            )
+                            meta["tip_slip_hand_mean_abs_after"] = float(
+                                tip_hybrid_state.star_grasp_mean_abs_after
+                            )
+                            meta["tip_slip_grasp_tighten_ok"] = bool(
+                                tip_hybrid_state.star_grasp_boosted
+                                and float(
+                                    tip_hybrid_state.star_grasp_mean_abs_after
+                                )
+                                > float(
+                                    tip_hybrid_state.star_grasp_mean_abs_before
+                                )
+                                + 1e-6
+                            )
+                        meta["tip_oracle_enable"] = bool(tip_oracle_enable)
+                        meta["tip_baseline_mode"] = str(tip_baseline_mode)
+                        meta["privileged_oracle_tip_servo"] = bool(
+                            tip_oracle_enable
+                            and (not tip_obs_enable)
+                            and (not tip_est_enable)
+                        )
+                        meta["track_a_tip_est"] = bool(tip_est_enable)
+                        meta["tip_est_backend"] = (
+                            "tip_axis_ekf"
+                            if tip_axis_enable and tip_theory_ekf is not None
+                            else (
+                                "theory_ekf"
+                                if tip_theory_ekf is not None
+                                else ("contact_v0" if tip_est is not None else "")
+                            )
+                        )
+                        meta["tip_est_err_peak_mm"] = float(tip_est_err_peak_m) * 1000.0
+                        meta["tip_est_err_mean_mm"] = (
+                            float(tip_est_err_sum_m) / float(tip_est_err_n) * 1000.0
+                            if tip_est_err_n > 0
+                            else -1.0
+                        )
+                        meta["tip_est_err_mean_seated_mm"] = float(
+                            meta["tip_est_err_mean_mm"]
+                        )
+                        meta["tip_est_seated_frames"] = int(tip_est_seated_frames)
+                        meta["tip_est_err_frames"] = int(tip_est_err_n)
+                        meta["tip_est_last_source"] = str(tip_est_last_source)
+                        meta["tip_est_uncert_peak_mm"] = (
+                            float(tip_est_uncert_peak_m) * 1000.0
+                            if tip_theory_ekf is not None
+                            else -1.0
+                        )
+                        meta["tip_est_axis_err_peak_deg"] = (
+                            float(np.degrees(tip_axis_err_peak_rad))
+                            if tip_axis_enable and tip_theory_ekf is not None
+                            else -1.0
+                        )
+                        meta["tip_est_uses_axis_hat"] = bool(
+                            tip_axis_enable and tip_theory_ekf is not None
+                        )
+                        meta["tip_est_residual_privilege"] = (
+                            "mujoco_peg_tray_contact_pos_intermittent"
+                            "+wrench_eligible"
+                            "+finger_proprio_axis"
+                            "+wrist_approach_prior"
+                            "+priv_grasp_slip"
+                            if tip_axis_enable and tip_theory_ekf is not None
+                            else (
+                                "mujoco_peg_tray_contact_pos_intermittent"
+                                "+wrench_eligible"
+                                "+priv_grasp_slip"
+                                "+geom_tip_posediff"
+                                "+gmhqp_tip_task_tec_gated_hat"
+                                if tip_tec_joint and tip_theory_ekf is not None
+                                else (
+                                    "mujoco_peg_tray_contact_pos_intermittent"
+                                    "+wrench_eligible"
+                                    "+priv_grasp_slip"
+                                    "+gmhqp_tip_task_uses_tip_hat"
+                                    if tip_gmhqp_tip_obs and tip_theory_ekf is not None
+                                    else (
+                                        "mujoco_peg_tray_contact_pos_intermittent+wrench_eligible+priv_grasp_slip"
+                                        if tip_theory_ekf is not None
+                                        else (
+                                            "mujoco_peg_tray_contact_pos+priv_grasp_slip"
+                                            if tip_est_enable
+                                            else ""
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                        meta["tec_joint_enable"] = bool(tip_tec_joint)
+                        meta["tec_joint_gated_on_frac"] = float(
+                            tec_joint_state.meta.get("tec_joint_gated_on_frac", 0.0)
+                        ) if tip_tec_joint else -1.0
+                        meta["tec_joint_last_reason"] = (
+                            str(tec_joint_state.last_reason) if tip_tec_joint else ""
+                        )
+                        meta["privileged_observation_noise"] = bool(tip_obs_enable)
+                        meta["tip_obs_noise_mm"] = float(tip_obs_sigma_mm)
+                        meta["tip_obs_lag_frames"] = int(tip_obs_lag_frames)
+                        meta["obs_noise"] = bool(tip_obs_enable)
+                        meta["tip_oracle_slip_trips"] = int(
+                            meta.get("tip_oracle_slip_trips", 0)
+                        )
+                        meta["tip_oracle_mouth_press_frames"] = int(
+                            tip_hybrid_state.oracle_mouth_press_frames
+                        )
+                        meta["tip_oracle_grasp_boosted"] = bool(
+                            tip_hybrid_state.oracle_grasp_boosted
+                        )
+                        meta["tip_phig_enable"] = bool(tip_phig_enable)
+                        meta["tip_phig_mode"] = str(phig_state.mode)
+                        meta["tip_phig_mouth_press_frames"] = int(
+                            phig_state.mouth_press_frames
+                        )
+                        meta["tip_phig_grasp_boosted"] = bool(phig_state.grasp_boosted)
+                        meta["tip_phig_slip_trips"] = int(
+                            meta.get("tip_phig_slip_trips", 0)
+                        )
                         meta["spiral_theta_rad"] = float(theta_sp)
                         meta["spiral_mode"] = (
                             str(search_mode)
@@ -3923,10 +10787,532 @@ def run_pbvs_biased_surface_press(
                             meta.get("spiral_pre_lat_frames", pre_lat_used)
                         )
                         meta["spiral_tip_xy_peak_mm"] = float(tip_xy_peak) * 1000.0
+                        meta["spiral_axis_src"] = str(spiral_axis_src)
+                        meta["spiral_axis_ang_peg_deg"] = float(ang_peg_n)
+                        meta["spiral_axis_ang_hole_deg"] = float(ang_hole_n)
                         meta["force_trace"] = force_trace
                         meta["force_trace_n"] = int(len(force_trace))
                         meta["grasp_slip_peak_m"] = float(grasp_slip_peak)
                         meta["grasp_latch_ok"] = True
+                        # ep06-style: already at mouth with N≈1 spiral. Replace priv
+                        # lat→insert with XY-hold + light probe until F/T hole drop.
+                        mouth_probe_n = int(
+                            a_cfg.get("surface_planned_mouth_probe_frames", 120)
+                        )
+                        mouth_probe_used = 0
+                        r_cmd_end = (
+                            float(planned_rs[min(planned_i, planned_rs.shape[0] - 1)])
+                            if planned_rs is not None
+                            else 1e9
+                        )
+                        feat_probe0 = features_from_raw(raw)
+                        mouth_probe_r_max = float(
+                            a_cfg.get(
+                                "surface_planned_mouth_probe_r_max_m",
+                                mouth_lat * 2.0,
+                            )
+                        )
+                        tip_probe0 = np.asarray(
+                            feat_probe0.tip_pos, dtype=np.float64
+                        ).reshape(3)
+                        tip_rho_probe0 = float(
+                            np.linalg.norm(
+                                _tip_lat_offset_xy(
+                                    tip_probe0, spiral_center, spiral_n
+                                )
+                            )
+                        )
+                        # Tip must currently be at/inside mouth radius.
+                        # Keep base lat / near_mouth gate (Tip-Hybrid already uses
+                        # tip–hole geometry for this stop). Do NOT gate on planner
+                        # tip_rho alone — frozen spiral_center can be 10–40 mm off
+                        # (false yield / skipped probe on ep01/04).
+                        near_for_mouth_probe = float(feat_probe0.lateral_m) <= (
+                            mouth_lat * 1.25
+                        ) or (
+                            str(spiral_reason) == "near_mouth"
+                            and float(feat_probe0.lateral_m) <= mouth_lat * 1.5
+                        )
+                        if (
+                            force_hole_detect
+                            and (not force_hole_state.entered)
+                            and mouth_probe_n > 0
+                            and search_mode == "planned_spiral"
+                            and near_for_mouth_probe
+                        ):
+                            hold_p = current_action44(raw)
+                            if getattr(ctrl, "_hold_l_hand", None) is not None:
+                                hold_p = hold_p.copy()
+                                hold_p[28:44] = np.asarray(
+                                    ctrl._hold_l_hand, dtype=np.float64
+                                ).reshape(16)
+                            probe_m = float(
+                                a_cfg.get(
+                                    "surface_planned_mouth_probe_press_m",
+                                    max(
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_probe_press_m",
+                                                0.00008,
+                                            )
+                                        ),
+                                        0.00012,
+                                    ),
+                                )
+                            )
+                            hard_unload_n = float(
+                                a_cfg.get(
+                                    "surface_planned_mouth_probe_hard_unload_n", 0.35
+                                )
+                            )
+                            # Agent-D oracle v2: stronger mouth press / higher unload bar.
+                            if tip_oracle_enable and bool(
+                                a_cfg.get("surface_tip_oracle_mouth_press", False)
+                            ):
+                                probe_m = max(
+                                    probe_m,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_tip_oracle_mouth_press_m",
+                                            0.00035,
+                                        )
+                                    ),
+                                )
+                                hard_unload_n = max(
+                                    hard_unload_n,
+                                    float(
+                                        a_cfg.get(
+                                            "surface_tip_oracle_mouth_hard_unload_n",
+                                            0.85,
+                                        )
+                                    ),
+                                )
+                                mouth_probe_n = max(
+                                    mouth_probe_n,
+                                    int(
+                                        a_cfg.get(
+                                            "surface_tip_oracle_mouth_probe_frames",
+                                            mouth_probe_n,
+                                        )
+                                    ),
+                                )
+                            # Track-B PHIG: same deployable mouth press boost (no tip GT).
+                            if tip_phig_enable:
+                                probe_m = max(
+                                    probe_m, float(phig_cfg.mouth_press_m)
+                                )
+                                hard_unload_n = max(
+                                    hard_unload_n,
+                                    float(phig_cfg.mouth_hard_unload_n),
+                                )
+                            along_mp0 = float(feat_probe0.along_m)
+                            tip_mp0 = float(feat_probe0.tip_socket_dist_m)
+                            # Use spiral press axis (into surface). Do NOT unload on
+                            # mild residual — that was lifting the tip away from mouth.
+                            press_p = np.asarray(
+                                press_ax_spiral, dtype=np.float64
+                            ).reshape(3)
+                            pn = float(np.linalg.norm(press_p))
+                            if pn < 1e-9:
+                                press_p = -spiral_n / (np.linalg.norm(spiral_n) + 1e-12)
+                            else:
+                                press_p = press_p / pn
+                            # Agent-D oracle: prefer hole-axis into-surface (ep08 float).
+                            if tip_oracle_enable:
+                                hole_u_mp0 = np.asarray(
+                                    feat_probe0.hole_axis, dtype=np.float64
+                                ).reshape(3)
+                                hn0 = float(np.linalg.norm(hole_u_mp0))
+                                if hn0 > 1e-12:
+                                    press_p = -(hole_u_mp0 / hn0)
+                            # Deployable: soft seat resid (~0.7N) must press into bore,
+                            # not retract (oracle/MSAR ep03: hard_unload=0.35 → float).
+                            jam_unload_n = float(
+                                a_cfg.get(
+                                    "surface_planned_mouth_probe_jam_n",
+                                    max(hard_unload_n, 1.2)
+                                    if deploy_mouth_enter
+                                    else hard_unload_n,
+                                )
+                            )
+                            seat_press_scale = float(
+                                a_cfg.get(
+                                    "surface_planned_mouth_probe_seat_press_scale",
+                                    2.5
+                                    if (
+                                        deploy_mouth_enter
+                                        or tip_phig_enable
+                                        or (
+                                            tip_oracle_enable
+                                            and bool(
+                                                a_cfg.get(
+                                                    "surface_tip_oracle_mouth_press",
+                                                    False,
+                                                )
+                                            )
+                                        )
+                                    )
+                                    else 1.0,
+                                )
+                            )
+                            seat_n_mp = float(
+                                a_cfg.get(
+                                    "surface_tip_hybrid_seat_contact_n", 0.05
+                                )
+                            )
+                            height_require_seat = bool(
+                                a_cfg.get(
+                                    "surface_planned_mouth_height_require_seat",
+                                    bool(deploy_mouth_enter),
+                                )
+                            )
+                            max_along_mp = float(
+                                a_cfg.get(
+                                    "surface_planned_priv_enter_max_along_m", 0.100
+                                )
+                            )
+                            # Fresh peak for mouth press: don't treat spiral soft
+                            # residual as a hole drop.
+                            force_hole_state.peak_contact_resid = 0.0
+                            force_hole_state.peak_abs_fz = 0.0
+                            force_hole_state.hole_confirm = 0
+                            force_hole_state.abs_fz_ema = 0.0
+                            xy_mode = (
+                                "hold_xy"
+                                if deploy_mouth_enter
+                                else "hole_axis"
+                            )
+                            print(
+                                f"pci: mouth-probe hold frames≤{mouth_probe_n} "
+                                f"probe={probe_m*1e3:.2f}mm/step "
+                                f"jam_unload>{jam_unload_n:.2f}N "
+                                f"xy={xy_mode} seat_scale={seat_press_scale:.1f}",
+                                flush=True,
+                            )
+                            mouth_track = float(
+                                a_cfg.get("surface_planned_mouth_probe_track", 1.2)
+                            )
+                            mouth_xy = float(
+                                a_cfg.get(
+                                    "surface_planned_mouth_probe_max_step_m",
+                                    0.006,
+                                )
+                            )
+                            for _mp in range(mouth_probe_n):
+                                contact_mp, left_mp, fz_r_mp, fz_l_mp = _wrist_contact()
+                                contact_mp = float(contact_mp)
+                                feat_pre = features_from_raw(raw)
+                                tip_pre = np.asarray(
+                                    feat_pre.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                if deploy_mouth_enter:
+                                    # Planner spiral center only — no privileged hole.
+                                    ctr_pre = np.asarray(
+                                        spiral_center, dtype=np.float64
+                                    ).reshape(3)
+                                else:
+                                    ctr_pre = _hole_axis_point_at_tip(
+                                        tip_pre,
+                                        feat_pre.socket_pos,
+                                        feat_pre.hole_axis,
+                                    )
+                                err_pre = ctr_pre - tip_pre
+                                err_pre = err_pre - spiral_n * float(
+                                    np.dot(err_pre, spiral_n)
+                                )
+                                en_pre = float(np.linalg.norm(err_pre))
+                                tip_rho_pre = float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            tip_pre, spiral_center, spiral_n
+                                        )
+                                    )
+                                )
+                                at_mouth_est = tip_rho_pre <= mouth_lat * 1.25 or (
+                                    float(feat_pre.lateral_m) <= mouth_lat * 1.25
+                                    and not deploy_mouth_enter
+                                )
+                                if deploy_mouth_enter:
+                                    # Hold tip XY (SEAT ownership). Do not chase
+                                    # planner center — frozen center can be 10–30 mm
+                                    # from true mouth and pulls tip off-hole (ep03).
+                                    d_xy = np.zeros(3, dtype=np.float64)
+                                else:
+                                    if en_pre > 1e-9:
+                                        d_xy = err_pre * min(
+                                            mouth_track, mouth_xy / en_pre
+                                        )
+                                    else:
+                                        d_xy = np.zeros(3, dtype=np.float64)
+                                site_pre = actual_action44_from_sites(raw)
+                                hold_p = current_action44(raw).copy()
+                                tip_high = float(feat_pre.tip_socket_dist_m) > 0.110
+                                # Oracle: no contact / tip high → reseat press only,
+                                # freeze XY so slip cannot fly tip off mouth (ep08).
+                                if tip_oracle_enable and (
+                                    tip_high or contact_mp < float(seat_n_mp) * 0.5
+                                ):
+                                    d_xy = np.zeros(3, dtype=np.float64)
+                                    hole_u_live = np.asarray(
+                                        feat_pre.hole_axis, dtype=np.float64
+                                    ).reshape(3)
+                                    hn_live = float(np.linalg.norm(hole_u_live))
+                                    if hn_live > 1e-12:
+                                        press_p = -(hole_u_live / hn_live)
+                                if contact_mp > jam_unload_n and (not tip_high):
+                                    # True jam only — soft seat resid must not retract.
+                                    ax_p = -press_p * probe_m
+                                elif tip_high or (
+                                    tip_oracle_enable
+                                    and contact_mp < float(seat_n_mp) * 0.5
+                                ):
+                                    # Tip high / float: dive to the face along hole.
+                                    ax_p = press_p * max(probe_m * 4.0, 0.00045)
+                                elif at_mouth_est and contact_mp >= seat_n_mp * 0.5:
+                                    # SEAT ownership at mouth: press into bore.
+                                    ax_p = press_p * max(
+                                        probe_m * seat_press_scale, 0.00025
+                                    )
+                                elif contact_mp < 0.03:
+                                    ax_p = press_p * max(probe_m * 2.0, 0.0002)
+                                else:
+                                    ax_p = press_p * probe_m
+                                hold_p[0:3] = site_pre[0:3] + d_xy + ax_p
+                                if getattr(ctrl, "_hold_l_hand", None) is not None:
+                                    hold_p[28:44] = np.asarray(
+                                        ctrl._hold_l_hand, dtype=np.float64
+                                    ).reshape(16)
+                                step_action44(
+                                    gym_env, hold_p, ego_recorder=ego_recorder
+                                )
+                                mouth_probe_used += 1
+                                steps += 1
+                                used_sp += 1
+                                feat_mp = features_from_raw(raw)
+                                wr_mp = read_wrist_wrench_world(raw)
+                                # Deployable: wrist-tool Fz, not hole-frame priv.
+                                _p_mp, rot_mp = _right_wrist_site_pose(raw)
+                                tf_mp = TaskFrame.from_wrist_site(hold_p[0:3], rot_mp)
+                                wh_mp = tf_mp.wrench_tool(wr_mp[0])
+                                tip_mp = np.asarray(
+                                    feat_mp.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                tip_rho_mp = float(
+                                    np.linalg.norm(
+                                        _tip_lat_offset_xy(
+                                            tip_mp, spiral_center, spiral_n
+                                        )
+                                    )
+                                )
+                                tip_lat_gate = float(feat_mp.lateral_m)
+                                r_mp = min(float(mouth_lat), 0.0045)
+                                axis_mp_deg = float(
+                                    np.degrees(float(feat_mp.axis_error_rad))
+                                )
+                                max_axis_mp = float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_max_axis_err_deg",
+                                        25.0,
+                                    )
+                                )
+                                # Deployable mouth-enter and oracle v2 both require
+                                # axis≤25 before accepting force-hole (SUCCESS_STANDARD).
+                                hold_axis_mp = bool(deploy_mouth_enter) or (
+                                    tip_oracle_enable
+                                    and bool(
+                                        a_cfg.get(
+                                            "surface_tip_oracle_hold_enter_seat",
+                                            True,
+                                        )
+                                    )
+                                )
+                                upright_ok_mp = (not hold_axis_mp) or (
+                                    axis_mp_deg <= max_axis_mp
+                                )
+                                if (not upright_ok_mp) and tip_oracle_enable:
+                                    tip_hybrid_state.mode = "upright"
+                                    tip_hybrid_state.upright_ok_streak = 0
+                                along_mp_now = float(feat_mp.along_m)
+                                tip_mp_now = float(feat_mp.tip_socket_dist_m)
+                                tip_bore_mp = tip_mp_now <= float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_tip_m", 0.095
+                                    )
+                                ) or along_mp_now <= float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_along_m", 0.095
+                                    )
+                                )
+                                along_ok_mp = tip_bore_mp or along_mp_now <= float(
+                                    a_cfg.get(
+                                        "surface_planned_priv_enter_max_along_m",
+                                        0.100,
+                                    )
+                                )
+                                seat_gate_mp = upright_ok_mp and (
+                                    (not tip_oracle_enable)
+                                    or (not bool(
+                                        a_cfg.get(
+                                            "surface_tip_oracle_hold_enter_seat",
+                                            True,
+                                        )
+                                    ))
+                                    or along_ok_mp
+                                )
+                                if seat_gate_mp and update_spiral_force_hole_detect(
+                                    force_hole_state,
+                                    fz_axial=float(wh_mp[2]),
+                                    f_lat=float(np.linalg.norm(wh_mp[:2])),
+                                    spiral_radius_m=r_mp,
+                                    step_idx=int(mouth_probe_used),
+                                    search_cfg=search_cfg_sp,
+                                    contact_resid_n=float(contact_mp),
+                                    tip_lat_m=float(tip_lat_gate),
+                                ):
+                                    spiral_reason = "hole_detected"
+                                    print(
+                                        f"pci: FORCE hole-enter via mouth-probe "
+                                        f"j={mouth_probe_used} |r|={contact_mp:.3f}N "
+                                        f"along={feat_mp.along_m*1e3:.1f}mm "
+                                        f"ρ={tip_rho_mp*1e3:.1f}mm "
+                                        f"lat={feat_mp.lateral_m*1e3:.1f}mm "
+                                        f"axis={axis_mp_deg:.1f}deg",
+                                        flush=True,
+                                    )
+                                    break
+                                # ConnTact-style: tip already at mouth + height drop
+                                # into bore (ep01: along 99→90 without F resid drop).
+                                drop_need_m = float(
+                                    a_cfg.get(
+                                        "surface_planned_mouth_along_drop_m",
+                                        0.004,
+                                    )
+                                )
+                                along_drop = along_mp0 - float(feat_mp.along_m)
+                                tip_drop = tip_mp0 - float(
+                                    feat_mp.tip_socket_dist_m
+                                )
+                                lat_ok_h = tip_lat_gate <= mouth_lat * (
+                                    1.05 if deploy_mouth_enter else 1.25
+                                )
+                                seat_ok_h = (not height_require_seat) or (
+                                    contact_mp >= seat_n_mp * 0.5
+                                    and float(feat_mp.along_m) <= max_along_mp
+                                )
+                                if (
+                                    upright_ok_mp
+                                    and seat_gate_mp
+                                    and lat_ok_h
+                                    and seat_ok_h
+                                    and max(along_drop, tip_drop) >= drop_need_m
+                                ):
+                                    force_hole_state.entered = True
+                                    spiral_reason = "hole_detected"
+                                    print(
+                                        f"pci: FORCE hole-enter via mouth-height "
+                                        f"j={mouth_probe_used} "
+                                        f"along_drop={along_drop*1e3:.1f}mm "
+                                        f"tip_drop={tip_drop*1e3:.1f}mm "
+                                        f"ρ={tip_rho_mp*1e3:.1f}mm "
+                                        f"lat={feat_mp.lateral_m*1e3:.1f}mm "
+                                        f"axis={axis_mp_deg:.1f}deg "
+                                        f"|r|={contact_mp:.3f}N",
+                                        flush=True,
+                                    )
+                                    break
+                                # While axis soft-bad, keep probing with SEAT press
+                                # but do not latch force-hole (audit axis gate).
+                                if (
+                                    deploy_mouth_enter
+                                    and tip_hybrid_enable
+                                    and axis_mp_deg > max_axis_mp
+                                    and mouth_probe_used % 30 == 0
+                                ):
+                                    print(
+                                        f"pci: mouth-probe hold for upright "
+                                        f"axis={axis_mp_deg:.1f}>{max_axis_mp:.1f}deg "
+                                        f"ρ={tip_rho_mp*1e3:.1f}mm "
+                                        f"|r|={contact_mp:.2f}N",
+                                        flush=True,
+                                    )
+                                contact_mp_log, left_mp_log, fz_r_log, fz_l_log = (
+                                    _wrist_contact()
+                                )
+                                f_des_mp = float(
+                                    a_cfg.get(
+                                        "surface_planned_near_hole_f_des_n",
+                                        a_cfg.get(
+                                            "surface_planned_spiral_f_des_n",
+                                            a_cfg.get(
+                                                "surface_const_force_des_n", 0.05
+                                            ),
+                                        ),
+                                    )
+                                )
+                                force_trace.append(
+                                    {
+                                        "t": float(t_force) * dt_f,
+                                        "step": float(t_force),
+                                        "phase": "mouth_probe",
+                                        "resid_r": float(contact_mp_log),
+                                        "resid_l": float(left_mp_log),
+                                        "fz_r": float(fz_r_log),
+                                        "fz_l": float(fz_l_log),
+                                        "f_des": float(f_des_mp),
+                                        "lat_mm": float(feat_mp.lateral_m) * 1000.0,
+                                        "along_mm": float(feat_mp.along_m) * 1000.0,
+                                        "force_hole_entered": int(
+                                            force_hole_state.entered
+                                        ),
+                                    }
+                                )
+                                t_force += 1
+                                if mouth_probe_used % 30 == 0:
+                                    print(
+                                        f"pci: mouth-probe j={mouth_probe_used} "
+                                        f"|r|={contact_mp:.2f}N "
+                                        f"ρ={tip_rho_mp*1e3:.1f}mm "
+                                        f"lat={feat_mp.lateral_m*1e3:.1f}mm "
+                                        f"along={feat_mp.along_m*1e3:.1f}mm",
+                                        flush=True,
+                                    )
+                                out_mp = env._labeler.compute(raw)
+                                if not out_mp.tray_ok:
+                                    break
+                            meta["mouth_probe_frames"] = int(mouth_probe_used)
+                            meta["force_planned_hole_entered"] = bool(
+                                force_hole_state.entered
+                            )
+                            meta["deploy_mouth_enter"] = bool(deploy_mouth_enter)
+                            feat_s = features_from_raw(raw)
+                            out_s = env._labeler.compute(raw)
+                            spiral_lat_min = min(
+                                spiral_lat_min, float(feat_s.lateral_m)
+                            )
+                            meta["spiral_lat_min_mm"] = float(spiral_lat_min) * 1000
+                            meta["spiral_reason"] = str(spiral_reason)
+                        ins_steps, t_force, ins_meta = _run_planned_spiral_axial_insert(
+                            env,
+                            gym_env,
+                            cfg=cfg,
+                            ctrl=ctrl,
+                            ego_recorder=ego_recorder,
+                            force_trace=force_trace,
+                            t_force=t_force,
+                            dt_f=dt_f,
+                            spiral_reason=str(spiral_reason),
+                            force_hole_entered=bool(
+                                force_hole_state.entered if force_hole_detect else False
+                            ),
+                            spiral_lat_min_m=float(spiral_lat_min),
+                        )
+                        if ins_meta:
+                            meta.update(ins_meta)
+                            meta["force_trace"] = force_trace
+                            meta["force_trace_n"] = int(len(force_trace))
+                            steps += int(ins_steps)
+                            feat_s = features_from_raw(raw)
+                            out_s = env._labeler.compute(raw)
                         gate = _priv_tip_spiral_gate(meta, cfg)
                         meta["priv_tip_spiral_gate"] = gate
                         meta.update(_final_geom_meta(feat_s, out_s, ctrl))
@@ -4156,25 +11542,101 @@ def run_pci_episode(
             clean["priv_tip_spiral_gate"] = gate
         tray_ok_demo = bool(out.tray_ok) and tilt_peak <= max_tilt_ok
         surface_ok_demo = bool(tray_ok_demo and gate.get("ok") and surface_ok)
+        insert_ok_demo = bool(clean.get("insert_ok", False))
+        mouth_enter_demo = bool(
+            clean.get("force_planned_hole_entered", False)
+            or clean.get("force_hole_entered", False)
+            or clean.get("mouth_enter_ok", False)
+        )
+        # Privileged audit (reporting only): tip seat + upright enter.
+        # Standard: tip-on-surface spiral AND axis not too tilted at enter.
+        # Reject: float search (ep03), sideways "enter" (ep02).
+        a_cfg = cfg.get("approach", {})
+        mouth_audit = float(a_cfg.get("surface_spiral_mouth_lat_m", 0.0045))
+        lat_min_m = float(clean.get("spiral_lat_min_mm", 1e9)) / 1000.0
+        along_drift_mm = float(clean.get("priv_planned_along_drift_peak_mm", 0.0))
+        tip_rise_m = float(clean.get("surface_tip_along_rise_m", 0.0))
+        tip_now_m = float(feat.tip_socket_dist_m)
+        along_now_m = float(feat.along_m)
+        axis_err_deg = float(np.degrees(feat.axis_error_rad))
+        clean["final_axis_err_deg"] = float(axis_err_deg)
+        float_peak_m = float(clean.get("spiral_tip_float_peak_m") or 0.0)
+        _cf = clean.get("spiral_contact_frac", None)
+        contact_frac = 1.0 if _cf is None else float(_cf)
+        tip_in_bore = tip_now_m <= float(
+            a_cfg.get("surface_planned_priv_enter_tip_m", 0.095)
+        ) or along_now_m <= float(
+            a_cfg.get("surface_planned_priv_enter_along_m", 0.095)
+        )
+        near_mouth_audit = lat_min_m <= mouth_audit * 1.25
+        max_axis = float(
+            a_cfg.get("surface_planned_priv_enter_max_axis_err_deg", 25.0)
+        )
+        max_float = float(
+            a_cfg.get("surface_planned_priv_enter_max_float_m", 0.004)
+        )
+        min_contact_frac = float(
+            a_cfg.get("surface_planned_priv_enter_min_contact_frac", 0.0)
+        )
+        max_along = float(
+            a_cfg.get("surface_planned_priv_enter_max_along_m", 0.100)
+        )
+        max_tip_rise = float(
+            a_cfg.get("surface_planned_priv_enter_max_tip_rise_m", 0.006)
+        )
+        axis_ok = axis_err_deg <= max_axis
+        # Floating over mouth (lat_min ok but along still high) is not enter.
+        along_ok = tip_in_bore or along_now_m <= max_along
+        # Geometry seat: tip plane float + rise. Contact frac is optional
+        # (light seeking force can sit below resid threshold while seated).
+        seat_ok = float_peak_m <= max_float and tip_rise_m <= max_tip_rise
+        n_c = int(clean.get("spiral_contact_frames") or 0)
+        if min_contact_frac > 1e-9 and n_c >= 30:
+            seat_ok = seat_ok and contact_frac >= min_contact_frac
+        lat_ok = near_mouth_audit or tip_in_bore
+        priv_enter_ok = bool(lat_ok and along_ok and axis_ok and seat_ok)
+        # Success: force hole + seated tip search + upright enter.
+        enter_ok = bool(mouth_enter_demo and priv_enter_ok)
+        mouth_ok_demo = enter_ok
         print(
             f"pci: stop_after_surface — tray_ok={int(bool(out.tray_ok))} "
             f"tilt_peak={tilt_peak:.2f}deg GATE={'PASS' if gate.get('ok') else 'FAIL'} "
             f"lat={feat.lateral_m*1e3:.1f}mm along={feat.along_m*1e3:.1f}mm "
-            f"tip={feat.tip_socket_dist_m*1e3:.1f}mm",
+            f"tip={feat.tip_socket_dist_m*1e3:.1f}mm "
+            f"axis={axis_err_deg:.1f}deg float={float_peak_m*1e3:.1f}mm "
+            f"cfrac={contact_frac:.2f} "
+            f"force_hole={int(mouth_enter_demo)} priv_audit={int(priv_enter_ok)} "
+            f"enter_ok={int(enter_ok)} insert_ok={int(insert_ok_demo)}",
             flush=True,
         )
         fail_reason = ""
-        if not surface_ok_demo:
-            if align_reason == "priv_tip_spiral_gate_fail" or not gate.get("ok"):
+        if not enter_ok:
+            if mouth_enter_demo and not priv_enter_ok:
+                if not axis_ok:
+                    fail_reason = "force_hole_axis_reject"
+                elif not seat_ok:
+                    fail_reason = "force_hole_float_reject"
+                elif not along_ok:
+                    fail_reason = "force_hole_along_reject"
+                else:
+                    fail_reason = "force_hole_priv_reject"
+            elif align_reason == "priv_tip_spiral_gate_fail" or not gate.get("ok"):
                 fail_reason = "priv_tip_spiral_gate_fail"
             elif not tray_ok_demo:
                 fail_reason = "surface_tilt_or_tray"
             else:
-                fail_reason = align_reason or "surface_fail"
+                fail_reason = align_reason or "no_force_hole"
         return {
-            "success": bool(surface_ok_demo),
-            "mouth_ok": False,
-            "insert_ok": False,
+            # Success = force hole + tip seat spiral + upright enter audit.
+            "success": bool(enter_ok),
+            "mouth_ok": bool(mouth_ok_demo),
+            "mouth_enter_ok": bool(enter_ok),
+            "force_hole_raw": bool(mouth_enter_demo),
+            "priv_enter_audit": bool(priv_enter_ok),
+            "priv_axis_ok": bool(axis_ok),
+            "priv_seat_ok": bool(seat_ok),
+            "insert_ok": bool(insert_ok_demo),
+            "surface_gate_ok": bool(surface_ok_demo),
             "tray_ok": bool(out.tray_ok),
             "peg_ok": bool(out.peg_ok),
             "fail_reason": fail_reason,
