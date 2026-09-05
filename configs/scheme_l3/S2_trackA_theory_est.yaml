@@ -435,7 +435,13 @@ approach:
   surface_planned_priv_enter_max_float_m: 0.004
   surface_planned_priv_enter_max_axis_err_deg: 25.0
   surface_planned_priv_enter_max_along_m: 0.100
-  surface_planned_priv_enter_min_contact_frac: 0.0
+  surface_planned_priv_enter_min_contact_frac: 0.80
+  surface_planned_priv_enter_min_early_contact_frac: 0.85
+  surface_planned_priv_enter_early_frames: 60
+  surface_planned_priv_enter_min_spiral_frames: 30
+  surface_pre_spiral_seat_enable: true
+  surface_spiral_require_seat: true
+  surface_path_reverse_reseat_enable: true
   surface_planned_seat_contact_n: 0.08
 
   surface_planned_approach_lat_m: 0.016

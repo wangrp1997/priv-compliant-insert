@@ -1,10 +1,8 @@
-_ablation: privileged_diagnostic_grasp_tighten
+_ablation: privileged_oracle_tip_servo_NOT_DEPLOYABLE
 _demo: mouth_P1_grasp_tight_1p25
 _pk:
-  name: S3_franka_spiral_faithful
-  goal: scheme_l3_franka_spiral_faithful_repro
-  paper_baseline: Franka ScriptedExpertPegV1 jam spiral (avinash246813579/franka-peg-in-hole)
-  source: refs/franka-peg-in-hole/scripted_expert_peg_v1.py
+  name: S2_oracle_tip_demo_far
+  goal: group_meeting_oracle_outward_NOT_DEPLOYABLE
 approach:
   align_abort_unload_frames: 20
   align_peg_abort_deg: 0.0
@@ -52,9 +50,42 @@ approach:
   soft_contact_relatch: false
   soft_latch_max_tilt_deg: 10.0
   standoff_tol_m: 0.02
+  surface_planned_priv_stop_on_enter: false
+  surface_planned_force_hole_detect: true
+  surface_planned_force_stop_on_hole: true
+  surface_planned_force_hole_only: true
+  surface_planned_insert_on_force_only: true
+  surface_planned_probe_press_m: 5.0e-05
+  surface_planned_mouth_probe_frames: 80
+  surface_planned_mouth_probe_hard_unload_n: 0.35
+  surface_planned_spiral_hard_unload_n: 0.12
+  surface_planned_seek_step_m: 0.0002
+  surface_planned_spiral_f_des_n: 0.12
+  surface_planned_force_ok_tol_n: 0.03
+  surface_planned_slide_unload_step_m: 0.00012
+  surface_planned_planar_force_gate_n: 0.55
+  surface_planned_spiral_surface_lock: true
+  surface_planned_spiral_soft_advance_miss: 2
+  surface_planned_probe_soft_advance_miss: 2
+  surface_planned_probe_catch_m: 0.008
+  surface_planned_spiral_catch_m: 0.008
+  surface_planned_probe_no_freeze_path: true
+  surface_spiral_force_insert: true
+  surface_spiral_force_insert_deployable_only: true
+  surface_spiral_force_insert_wrist_frame: true
+  surface_spiral_force_insert_require_hole: true
+  surface_spiral_force_insert_after_spiral: false
+  surface_spiral_force_insert_min_lat_m: 0.016
+  surface_spiral_force_insert_steps: 200
+  surface_spiral_force_insert_peg_grace_frames: 24
+  surface_spiral_force_insert_pure_axial: true
+  surface_spiral_force_insert_max_ax_step_m: 0.00055
+  surface_grasp_ramp_enable: true
+  surface_grasp_ramp_tilt_deg: 4.0
+  surface_grasp_ramp_step: 0.04
   stop_after_surface: true
   surface_align_left_admit_scale: 0.0
-  surface_const_force_des_n: 0.04
+  surface_const_force_des_n: 0.08
   surface_const_force_frames: 0
   surface_const_force_kp_m_per_n: 0.0003
   surface_const_force_left_share: 0.0
@@ -75,16 +106,13 @@ approach:
   surface_force_delta_n: 0.55
   surface_force_soft_delta_n: 0.28
   surface_force_unload_boost: 2.5
-  surface_freeze_left: false
+  surface_freeze_left: true
   surface_freeze_left_hand: true
   surface_grasp_ramp_admit_boost: 0.0
   surface_grasp_ramp_admit_boost_cap: 0.0
-  surface_grasp_ramp_enable: false
   surface_grasp_ramp_interval_steps: 2
   surface_grasp_ramp_max_scale: 1.0
   surface_grasp_ramp_rel_rot_rad: 0.06
-  surface_grasp_ramp_step: 0.04
-  surface_grasp_ramp_tilt_deg: 4.0
   surface_hold_frames: 8
   surface_hold_left_admit_scale: 0.0
   surface_left_grasp_scale: 1.0
@@ -117,85 +145,60 @@ approach:
   surface_mouth_wiggle_xy_m: 0.0018
   surface_path_reverse_backoff_frames: 40
   surface_path_reverse_dist_m: 0.025
-  surface_path_reverse_enable: true
+  surface_path_reverse_enable: false
   surface_path_reverse_frames: 120
   surface_path_reverse_keep_force: true
   surface_path_reverse_step_m: 0.00035
   surface_path_reverse_tip_m: 0.002
   surface_phase_a_left_qp_fingers: false
   surface_planned_along_hold_slack_m: 0.0025
-  surface_planned_force_ok_tol_n: 0.008
-  surface_planned_force_overload_n: 0.07
+  surface_planned_force_overload_n: 0.55
+  surface_planned_probe_ignore_overforce_abort: true
+  surface_planned_priv_overforce_frames: 30
+  surface_planned_priv_lat_stall_frames: 200
+  surface_planned_seek_unload_cap_m: 0.0001
   surface_planned_force_seat_frames: 0
-  surface_planned_grasp_slip_hard_m: 0.14
+  surface_planned_grasp_slip_hard_m: 0.5
+  surface_planned_spiral_max_tilt_hard_deg: 40.0
+  surface_planned_spiral_max_tilt_soft_deg: 30.0
   surface_planned_heavy_unload_m: 0.0015
   surface_planned_insert_f_des_n: 0.05
   surface_planned_insert_lat_m: 0.008
   surface_planned_insert_step_m: 0.0003
   surface_planned_light_press_only: false
-  surface_planned_lost_contact_frames: 8
-  surface_planned_lost_contact_n: 0.012
+  surface_planned_lost_contact_frames: 4
+  surface_planned_lost_contact_n: 0.06
   surface_planned_micro_lift_enable: false
   surface_planned_micro_lift_end_n: 0.025
   surface_planned_micro_lift_frames: 8
   surface_planned_micro_lift_m: 0.0007
-  surface_planned_near_hole_f_des_n: 0.04
+  surface_planned_near_hole_f_des_n: 0.06
   surface_planned_near_hole_lat_m: 0.012
   surface_planned_overload_cooldown_frames: 18
-  surface_planned_overload_planar_scale: 0.12
-  surface_planned_planar_force_gate_n: 0.048
-  surface_planned_planar_ramp_frames: 150
-  surface_planned_priv_along_drift_abort_m: 0.008
+  surface_planned_overload_planar_scale: 0.85
+  surface_planned_planar_ramp_frames: 30
+  surface_planned_priv_along_drift_abort_m: 0.02
   surface_planned_priv_detect_enable: true
-  surface_planned_priv_enter_along_m: 0.003
+  surface_planned_priv_enter_along_m: 0.095
   surface_planned_priv_enter_confirm: 4
   surface_planned_priv_enter_lat_m: 0.0045
-  surface_planned_priv_guard_abort: false
-  surface_planned_priv_lat_stall_frames: 200
+  surface_planned_priv_guard_abort: true
+  surface_spiral_left_admit_scale: 0.0
+  surface_spiral_left_share: 0.0
+  surface_planned_spiral_left_share: 0.0
   surface_planned_priv_mouth_lat_m: 0.008
-  surface_planned_priv_overforce_frames: 30
-  surface_planned_priv_stop_on_enter: true
-  surface_planned_recontact_f_des_n: 0.05
-  surface_planned_recontact_frames: 25
+  surface_planned_recontact_f_des_n: 0.14
+  surface_planned_recontact_frames: 30
   surface_planned_recontact_max_step_m: 0.0008
-  surface_planned_recontact_ok_n: 0.035
+  surface_planned_recontact_ok_n: 0.1
   surface_planned_recontact_step_m: 0.00025
   surface_planned_recontact_track: 0.2
   surface_planned_recovery_lift_m: 0.0035
-  surface_planned_seek_step_m: 0.0001
-  surface_planned_spiral_catch_m: 0.0015
-  surface_planned_spiral_f_des_n: 0.025
-  surface_planned_spiral_freeze_offset: true
+  surface_planned_spiral_freeze_offset: false
   surface_planned_spiral_grace_frames: 120
-  surface_planned_spiral_max_step_m: 0.006
-  surface_planned_spiral_max_tilt_hard_deg: 20.0
-  surface_planned_spiral_max_wrist_step_m: 0.008
-  surface_planned_spiral_soft_advance_miss: 0
-  surface_planned_spiral_surface_lock: false
-  surface_planned_spiral_track: 1.35
-  # Faithful Franka ScriptedExpertPegV1 jam spiral (not PCI geometric spiral).
-  surface_tip_search_mode: franka_spiral
-  surface_tip_baseline: franka_tcp
-  surface_tip_spiral_center: socket
-  surface_franka_force_threshold_n: 0.08
-  surface_franka_r_base_m: 0.0002
-  surface_franka_r_growth_m: 0.0002
-  surface_franka_r_max_m: 0.015
-  surface_franka_omega_rad: 0.4
-  surface_franka_jam_lift_m: 0.040
-  surface_franka_jam_lift_step_m: 0.002
-  surface_franka_insert_z_ramp_m: 0.0005
-  surface_franka_height_drop_m: 0.0004
-  surface_franka_height_enter: true
-  # Soften tray/tilt abort for long jam search (still SUCCESS_STANDARD at enter).
-  surface_spiral_max_tilt_deg: 20.0
-  surface_planned_spiral_max_tilt_hard_deg: 28.0
-  surface_mouth_continue_on_near: true
-  surface_tip_hybrid_enable: false
-  surface_tip_msar_enable: false
-  surface_tip_star_enable: false
-  surface_planned_force_hole_detect: false
-  surface_planned_priv_stop_on_enter: false
+  surface_planned_spiral_max_step_m: 0.008
+  surface_planned_spiral_max_wrist_step_m: 0.012
+  surface_planned_spiral_track: 2.2
   surface_planned_stuck_err_m: 0.004
   surface_planned_stuck_force_n: 0.06
   surface_planned_stuck_frames: 8
@@ -242,10 +245,8 @@ approach:
   surface_spiral_along_hold: true
   surface_spiral_frames: 2400
   surface_spiral_lat_shrink_only: false
-  surface_spiral_left_admit_scale: 0.0
   surface_spiral_left_max_step_m: 0.004
-  surface_spiral_left_share: 0.0
-  surface_spiral_max_tilt_deg: 20.0
+  surface_spiral_max_tilt_deg: 12.0
   surface_spiral_mouth_lat_m: 0.0045
   surface_spiral_pre_lat_frames: 0
   surface_spiral_pre_lat_step_m: 0.002
@@ -254,29 +255,60 @@ approach:
   surface_stiction_unload_frames: 0
   surface_stiction_unload_n: 0.0
   surface_tip_lift_m: 0.002
-  surface_tip_search_mode: franka_spiral
+  surface_tip_search_mode: planned_spiral
+  surface_tip_hybrid_enable: false
+  surface_tip_msar_enable: false
+  surface_tip_hybrid_float_tol_m: 0.0015
+  surface_tip_hybrid_seat_contact_n: 0.08
+  surface_tip_hybrid_seat_press_m: 0.00055
+  surface_tip_hybrid_seat_track: 0.15
+  surface_tip_hybrid_upright_soft_deg: 18.0
+  surface_tip_hybrid_upright_step_deg: 1.2
+  surface_tip_hybrid_upright_confirm: 3
+  surface_tip_hybrid_spiral_orient_scale: 0.35
+  surface_tip_hybrid_max_along_m: 0.1
+  surface_tip_hybrid_soft_press_m: 0.00035
   surface_tip_servo_lift_enable: false
-  surface_tip_spiral_axis: contact_normal
+  surface_tip_spiral_axis: hole
   surface_tip_spiral_boost_wrist_step_m: 0.006
   surface_tip_spiral_center: socket
-  surface_tip_spiral_contact_fmin_n: 0.03
-  surface_tip_spiral_direction: outward
+  surface_tip_spiral_contact_fmin_n: 0.04
+  surface_tip_spiral_direction: inward
   surface_tip_spiral_freeze_offset: true
-  surface_tip_spiral_max_step_m: 0.006
-  surface_tip_spiral_max_wrist_step_m: 0.01
-  surface_tip_spiral_pitch_m: 0.0012
+  surface_tip_spiral_max_step_m: 0.005
+  surface_tip_spiral_max_wrist_step_m: 0.012
+  surface_tip_spiral_pitch_m: 0.003
   surface_tip_spiral_r0_m: 0.002
-  surface_tip_spiral_rmax_m: 0.022
+  surface_tip_spiral_rmax_m: 0.042
   surface_tip_spiral_rmin_m: 0.003
-  surface_tip_spiral_step_rad: 0.04
-  surface_tip_spiral_track: 1.2
+  surface_tip_spiral_step_rad: 0.09
+  surface_tip_spiral_track: 2.2
   surface_tray_lost_frames: 12
   surface_unload_retract_m: 0.0
-  # SUCCESS_STANDARD audits (paper table uses same enter definition).
-  surface_planned_priv_enter_max_axis_err_deg: 25.0
-  surface_planned_priv_enter_max_along_m: 0.100
-  surface_planned_priv_enter_max_float_m: 0.004
+  surface_tip_baseline: priv_oracle_tip_servo
+  surface_tip_oracle_mouth: true
+  surface_tip_oracle_track: 2.8
+  surface_tip_oracle_max_step_m: 0.016
+  surface_tip_oracle_force_gate: false
+  surface_tip_coupling_planar_c: false
+  surface_tip_coupling_window: 24
+  surface_tip_coupling_ema: 0.88
+  surface_tip_coupling_alpha_floor: 0.18
+  surface_planned_update_contact_normal: false
+  surface_planned_normal_blend: 0.08
+  surface_planned_tip_gate_frames_per_wp: 1
+  surface_planned_mouth_probe_r_max_m: 0.009
+  surface_planned_spiral_wrist_ff: false
+  surface_planned_probe_ignore_along_drift_abort: true
+  surface_planned_stiction_soft_advance_miss: 0
+  surface_planned_heavy_resid_n: 0.45
+  surface_planned_mouth_probe_press_m: 0.00025
+  surface_planned_mouth_along_drop_m: 0.003
+  surface_planned_priv_enter_tip_m: 0.095
   surface_planned_priv_enter_max_tip_rise_m: 0.006
+  surface_planned_priv_enter_max_float_m: 0.004
+  surface_planned_priv_enter_max_axis_err_deg: 25.0
+  surface_planned_priv_enter_max_along_m: 0.1
   surface_planned_priv_enter_min_contact_frac: 0.80
   surface_planned_priv_enter_min_early_contact_frac: 0.85
   surface_planned_priv_enter_early_frames: 60
@@ -284,6 +316,18 @@ approach:
   surface_pre_spiral_seat_enable: true
   surface_spiral_require_seat: true
   surface_path_reverse_reseat_enable: true
+  surface_planned_seat_contact_n: 0.1
+  surface_planned_approach_lat_m: 0.042
+  surface_planned_approach_frames: 480
+  surface_demo_outward_lat_m: 0.03
+  surface_demo_outward_frames: 140
+  surface_demo_outward_step_m: 0.0015
+  surface_demo_outward_track: 3.0
+  surface_demo_outward_max_wrist_step_m: 0.016
+  surface_demo_outward_f_des_n: 0.12
+  surface_planned_spiral_keep_f_des: true
+  surface_demo_outward_reseat_frames: 40
+  surface_planned_recontact_max_planar_m: 0.08
 compliant:
   fingers:
     b_admit: 0.45
@@ -303,7 +347,7 @@ compliant:
     f_axial_limit_n: 12.0
     f_insert_des_n: 0.8
     f_lateral_limit_n: 8.0
-    hold_press_m: 0.00012
+    hold_press_m: 8.0e-05
     left_insert_share: 0.0
     max_admit_step_m: 0.002
     max_insert_steps: 2500
@@ -311,7 +355,8 @@ compliant:
     peck_enable: false
     retreat_step_m: 0.0008
     stall_patience: 12
-    wiggle_radius_m: 0.0
+    wiggle_radius_m: 0.00035
+    depth_stall_patience: 20
     wrench_lpf_alpha: 0.35
   latch_freeze: true
   left_tray_follow:
@@ -381,11 +426,21 @@ compliant:
     discrete_hop: false
     f_axial_max_n: 10.0
     hold_press_m: 8.0e-05
-    hole_detect_confirm: 4
-    hole_detect_fz_drop_n: 0.85
+    hole_detect_confirm: 3
+    hole_detect_fz_drop_n: 0.45
+    hole_detect_resid_drop_n: 0.08
+    hole_detect_require_near_mouth: true
+    hole_detect_require_tip_near_mouth: true
+    hole_detect_tip_mouth_scale: 1.25
+    hole_detect_mouth_radius_scale: 1.25
+    mouth_probe_min_steps: 30
+    mouth_probe_peak_min_n: 0.08
+    mouth_max_lat_m: 0.0045
+    min_search_steps: 8
     hole_f_max_n: 6.0
     hole_fxy_max_n: 5.0
     hole_fz_max_after_drop_n: 6.0
+    hole_detect_ignore_fxy_with_resid: true
     hop_clear_m: 0.0008
     hop_lift_cmd_budget_m: 0.02
     hop_lift_m: 0.0015
@@ -412,12 +467,10 @@ compliant:
     max_admit_step_m: 0.002
     max_lat_step_m: 0.002
     max_search_steps: 2400
-    min_search_steps: 40
     mocap_site_drift_cap_m: 0.004
     mouth_hold_confirm_frames: 5
     mouth_hold_stop: true
     mouth_max_along_m: 0.105
-    mouth_max_lat_m: 0.0045
     mouth_max_tilt_deg: 18.0
     near_axial_keep_lat_m: 0.0018
     near_bottom_axial_drift_cap_m: 0.003
@@ -498,5 +551,5 @@ sim:
   max_control_steps: 4500
   max_pos_step_m: 0.003
   max_rot_step_rad: 0.02
-  max_seconds: 120.0
+  max_seconds: 180.0
 theory_pose_qp: true

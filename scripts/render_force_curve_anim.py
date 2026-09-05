@@ -103,20 +103,25 @@ def main() -> int:
                 x["t"] = i / float(fps)
 
     t = np.asarray([float(x["t"]) for x in trace], dtype=np.float64)
-    rr = np.asarray(
-        [float(x["resid_r"]) if x.get("resid_r") is not None else float("nan") for x in trace],
-        dtype=np.float64,
-    )
-    rl = np.asarray(
-        [float(x["resid_l"]) if x.get("resid_l") is not None else float("nan") for x in trace],
-        dtype=np.float64,
-    )
+    # Carry-forward so mouth/insert frames without left/f_des still draw continuous curves.
+    rr_list: list[float] = []
+    rl_list: list[float] = []
     fdes_list: list[float] = []
+    last_rr = float("nan")
+    last_rl = float("nan")
     last_fdes = float("nan")
     for x in trace:
+        if x.get("resid_r") is not None:
+            last_rr = float(x["resid_r"])
+        if x.get("resid_l") is not None:
+            last_rl = float(x["resid_l"])
         if x.get("f_des") is not None:
             last_fdes = float(x["f_des"])
+        rr_list.append(last_rr)
+        rl_list.append(last_rl)
         fdes_list.append(last_fdes)
+    rr = np.asarray(rr_list, dtype=np.float64)
+    rl = np.asarray(rl_list, dtype=np.float64)
     fdes = np.asarray(fdes_list, dtype=np.float64)
     phases = [str(x.get("phase", "")) for x in trace]
 

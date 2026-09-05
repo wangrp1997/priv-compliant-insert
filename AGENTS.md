@@ -14,12 +14,12 @@
 
 ## Current honest rate
 
-- Tip-Hybrid + planar_C: **4/10** on `outputs/scheme_l3/S2_force_enter_ep1_10v10/`.
-- Type-A: **5/10** on `outputs/scheme_l3/S2_typeA_ep1_10/`.
-- Track-B GMHQP: **6/10** on `outputs/scheme_l3/S2_trackB_gmhqp_ep1_10/` (ok 1,4,6,8,9,10).
-- **Track-B GMHQP-AC (best deployable): 7/10** on `outputs/scheme_l3/S2_trackB_gmhqp_ac_ep1_10/` (ok 1,4,6,7,8,9,10; fail 2,3,5). Disclose in-hand tip-geom surrogate.
-- Track-A tip_obs full **4/10** STOP; wave-6 tip_fuse smoke **1/7** keep-FAIL STOP (`docs/WAVE6_TRACK_A_PRIV.md`).
-- Paper tables: `docs/PAPER_BASELINE_MATRIX_SUCCESS.md`.
+> **Hard seat (2026-09-04):** 浮空搜孔不算成功。主表走 `docs/SUCCESS_STANDARD.md`（early≥0.85, cfrac≥0.80, n≥30）。旧论文 RATE（`min_contact_frac:0`）仅旁注。
+
+离线重扫（旧跑、未重采）诚实贴面：Hybrid **1/10**、Type-A **1/10**、GMHQP **0/10**、GMHQP-AC **0/10**（论文曾 4/5/6/7）。
+控制侧已加 pre-spiral SEAT + spiral 禁浮空搜；重跑 Rate 待 smoke/ep1–10。
+
+- Paper tables: `docs/PAPER_BASELINE_MATRIX_SUCCESS.md`（须标 seat vs legacy）。
 
 ## Oracle (Agent-D, not deployable)
 

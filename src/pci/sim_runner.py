@@ -2542,6 +2542,65 @@ def run_pbvs_biased_surface_press(
                             meta["path_reverse"] = True
                             meta["path_reverse_backoff_frames"] = int(backoff)
                             path_rev_done = True
+                            # Path-reverse often lifts tip off tray (START_FLOAT).
+                            # Hard seat: press-only reseat before any further search.
+                            if bool(
+                                a_cfg.get(
+                                    "surface_path_reverse_reseat_enable", True
+                                )
+                            ):
+                                pr_n = int(
+                                    a_cfg.get(
+                                        "surface_path_reverse_reseat_frames", 120
+                                    )
+                                )
+                                pr_f = float(
+                                    a_cfg.get(
+                                        "surface_path_reverse_reseat_f_des_n",
+                                        max(float(f_des), 0.12),
+                                    )
+                                )
+                                print(
+                                    f"pci: path-reverse reseat frames≤{pr_n} "
+                                    f"f_des={pr_f:.2f}N (no planar)",
+                                    flush=True,
+                                )
+                                for _prs in range(max(0, pr_n)):
+                                    site_now = actual_action44_from_sites(raw)
+                                    contact, left_c, fz_r, fz_l = _wrist_contact()
+                                    if float(contact) >= max(
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_seat_contact_n",
+                                                0.08,
+                                            )
+                                        ),
+                                        0.05,
+                                    ):
+                                        if _prs >= 10:
+                                            print(
+                                                f"pci: path-reverse reseat OK "
+                                                f"j={_prs} |r|={contact:.2f}N",
+                                                flush=True,
+                                            )
+                                            break
+                                    err_f = pr_f - float(contact)
+                                    ax_step = float(
+                                        np.clip(kp * err_f, -max_step, max_step)
+                                    )
+                                    if err_f > 0.0:
+                                        ax_step = max(ax_step, 5e-5)
+                                    cmd = hold.copy()
+                                    cmd[0:3] = site_now[0:3] + press_ax * ax_step
+                                    cmd[6:22] = hold_r_hand
+                                    cmd[22:28] = hold_l
+                                    cmd[28:44] = hold_l_hand
+                                    step_action44(
+                                        gym_env, cmd, ego_recorder=ego_recorder
+                                    )
+                                    _log_force("path_reverse_reseat")
+                                    steps += 1
+                                meta["path_reverse_reseat"] = True
 
                         # --- Phase 1a: break tip stiction (deep unload + tip-plane dither).
                         # Static friction sticks tip after soft latch; axial bleed alone
@@ -4243,8 +4302,17 @@ def run_pbvs_biased_surface_press(
                         spiral_axis_err_peak_deg = 0.0
                         spiral_contact_ok_n = 0
                         spiral_contact_frames = 0
+                        spiral_early_contact_ok_n = 0
+                        spiral_early_frames_n = int(
+                            a_cfg.get(
+                                "surface_planned_priv_enter_early_frames", 60
+                            )
+                        )
                         seat_contact_n = float(
                             a_cfg.get("surface_planned_seat_contact_n", 0.08)
+                        )
+                        require_seat_search = bool(
+                            a_cfg.get("surface_spiral_require_seat", True)
                         )
                         off0_xy = _tip_lat_offset_xy(
                             tip_sp0, spiral_center, spiral_n
@@ -5509,18 +5577,298 @@ def run_pbvs_biased_surface_press(
                         f_des_spiral = float(f_des)
                         if search_mode == "planned_spiral":
                             c0, _, _, _ = _wrist_contact()
-                            f_des_spiral = min(
-                                float(f_des),
-                                max(
-                                    0.012,
-                                    float(c0) * 1.1 + 0.004,
-                                ),
+                            if bool(
+                                a_cfg.get("surface_planned_spiral_keep_f_des", False)
+                            ):
+                                f_des_spiral = float(
+                                    a_cfg.get(
+                                        "surface_planned_spiral_f_des_n", f_des
+                                    )
+                                )
+                                print(
+                                    f"pci: planned-spiral keep f_des="
+                                    f"{f_des_spiral:.3f}N (contact0={c0:.3f}N)",
+                                    flush=True,
+                                )
+                            else:
+                                f_des_spiral = min(
+                                    float(f_des),
+                                    max(
+                                        0.012,
+                                        float(c0) * 1.1 + 0.004,
+                                    ),
+                                )
+                                print(
+                                    f"pci: planned-spiral f_des cap "
+                                    f"{f_des_spiral:.3f}N (contact0={c0:.3f}N)",
+                                    flush=True,
+                                )
+                        # Demo-only: push tip outward on the tray while holding
+                        # contact, so spiral starts with a larger planar error
+                        # (visible search) without breaking seat.
+                        demo_out_lat = float(
+                            a_cfg.get("surface_demo_outward_lat_m", 0.0)
+                        )
+                        demo_out_n = int(
+                            a_cfg.get("surface_demo_outward_frames", 0)
+                        )
+                        demo_out_step = float(
+                            a_cfg.get("surface_demo_outward_step_m", 0.0015)
+                        )
+                        if demo_out_lat > 1e-4 and demo_out_n > 0:
+                            track_out = float(
+                                a_cfg.get(
+                                    "surface_demo_outward_track",
+                                    a_cfg.get("surface_tip_oracle_track", 3.0),
+                                )
+                            )
+                            max_cmd_out = float(
+                                a_cfg.get(
+                                    "surface_demo_outward_max_wrist_step_m",
+                                    0.02,
+                                )
+                            )
+                            f_des_out = float(
+                                a_cfg.get(
+                                    "surface_demo_outward_f_des_n",
+                                    max(float(f_des), 0.08),
+                                )
                             )
                             print(
-                                f"pci: planned-spiral f_des cap "
-                                f"{f_des_spiral:.3f}N (contact0={c0:.3f}N)",
+                                f"pci: demo outward lat→{demo_out_lat*1e3:.1f}mm "
+                                f"frames≤{demo_out_n} step={demo_out_step*1e3:.1f}mm "
+                                f"track={track_out:.1f} f_des={f_des_out:.2f}N "
+                                f"(tip-track keep seat)",
                                 flush=True,
                             )
+                            lat_out0 = float(features_from_raw(raw).lateral_m)
+                            for _out_j in range(1, demo_out_n + 1):
+                                feat_i = features_from_raw(raw)
+                                site_now = actual_action44_from_sites(raw)
+                                tip = np.asarray(
+                                    feat_i.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                ax_i = feat_i.hole_axis / (
+                                    np.linalg.norm(feat_i.hole_axis) + 1e-12
+                                )
+                                # Radial in contact plane: tip − hole-axis point.
+                                ctr = _hole_axis_point_at_tip(
+                                    tip, feat_i.socket_pos, feat_i.hole_axis
+                                )
+                                off_xy = tip - ctr
+                                off_xy = off_xy - ax_i * float(np.dot(off_xy, ax_i))
+                                lat_now = float(feat_i.lateral_m)
+                                if lat_now >= demo_out_lat:
+                                    print(
+                                        f"pci: demo outward done j={_out_j} "
+                                        f"lat={lat_now*1e3:.1f}mm "
+                                        f"(from {lat_out0*1e3:.1f}mm)",
+                                        flush=True,
+                                    )
+                                    break
+                                n_xy = float(np.linalg.norm(off_xy))
+                                if n_xy < 1e-6:
+                                    rad = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                                    rad = rad - ax_i * float(np.dot(rad, ax_i))
+                                    n_xy = float(np.linalg.norm(rad)) + 1e-12
+                                    off_xy = rad * n_xy
+                                step_v = off_xy * (
+                                    min(demo_out_step, demo_out_lat - lat_now)
+                                    / (n_xy + 1e-12)
+                                )
+                                target = tip + step_v
+                                contact, left_c, fz_r, fz_l = _wrist_contact()
+                                contact_sp = float(contact)
+                                err_f = f_des_out - contact_sp
+                                ax_step = float(
+                                    np.clip(kp * err_f, -max_step, max_step)
+                                )
+                                site_xyz = site_now[0:3].copy()
+                                # Soft grasp: C≠I — command wrist from tip error,
+                                # not tip+offset (that barely moves tip).
+                                tip_err = target - tip
+                                tip_err = tip_err - ax_i * float(
+                                    np.dot(tip_err, ax_i)
+                                )
+                                hold_r = (
+                                    site_xyz
+                                    + track_out * tip_err
+                                    + press_ax * ax_step
+                                )
+                                d_cmd = hold_r - site_xyz
+                                dn = float(np.linalg.norm(d_cmd))
+                                if dn > max_cmd_out > 0.0:
+                                    hold_r = site_xyz + d_cmd * (max_cmd_out / dn)
+                                cmd = np.zeros(44, dtype=np.float64)
+                                cmd[0:6] = site_now[0:6].copy()
+                                cmd[0:3] = hold_r
+                                _fill_tip_search_hands(cmd)
+                                cmd[22:28] = hold_l
+                                step_action44(
+                                    gym_env, cmd, ego_recorder=ego_recorder
+                                )
+                                feat_after = features_from_raw(raw)
+                                force_trace.append(
+                                    {
+                                        "t": float(t_force) * dt_f,
+                                        "step": float(t_force),
+                                        "phase": "demo_outward",
+                                        "resid_r": float(contact_sp),
+                                        "resid_l": float(left_c),
+                                        "fz_r": float(fz_r),
+                                        "fz_l": float(fz_l),
+                                        "lat_mm": float(feat_after.lateral_m)
+                                        * 1000.0,
+                                        "along_mm": float(feat_after.along_m)
+                                        * 1000.0,
+                                        "f_des": float(f_des_out),
+                                    }
+                                )
+                                t_force += 1
+                                steps += 1
+                            lat_out1 = float(features_from_raw(raw).lateral_m)
+                            if lat_out1 + 1e-4 < demo_out_lat:
+                                print(
+                                    f"pci: demo outward SHORT lat={lat_out1*1e3:.1f}mm "
+                                    f"< target {demo_out_lat*1e3:.1f}mm "
+                                    f"(Δ={(lat_out1-lat_out0)*1e3:.1f}mm)",
+                                    flush=True,
+                                )
+                            meta["demo_outward_lat_m"] = float(demo_out_lat)
+                            meta["demo_outward_lat_achieved_m"] = float(lat_out1)
+                            # Press reseat after outward so spiral does not start floating.
+                            reseat_n = int(
+                                a_cfg.get("surface_demo_outward_reseat_frames", 0)
+                            )
+                            if reseat_n > 0:
+                                f_reseat = float(
+                                    a_cfg.get(
+                                        "surface_demo_outward_f_des_n",
+                                        max(float(f_des), 0.1),
+                                    )
+                                )
+                                print(
+                                    f"pci: demo outward reseat frames={reseat_n} "
+                                    f"f_des={f_reseat:.2f}N",
+                                    flush=True,
+                                )
+                                for _rs in range(reseat_n):
+                                    site_now = actual_action44_from_sites(raw)
+                                    contact, left_c, fz_r, fz_l = _wrist_contact()
+                                    err_f = f_reseat - float(contact)
+                                    ax_step = float(
+                                        np.clip(kp * err_f, -max_step, max_step)
+                                    )
+                                    cmd = np.zeros(44, dtype=np.float64)
+                                    cmd[0:6] = site_now[0:6].copy()
+                                    cmd[0:3] = site_now[0:3] + press_ax * ax_step
+                                    _fill_tip_search_hands(cmd)
+                                    cmd[22:28] = hold_l
+                                    step_action44(
+                                        gym_env, cmd, ego_recorder=ego_recorder
+                                    )
+                                    feat_after = features_from_raw(raw)
+                                    force_trace.append(
+                                        {
+                                            "t": float(t_force) * dt_f,
+                                            "step": float(t_force),
+                                            "phase": "demo_outward_reseat",
+                                            "resid_r": float(contact),
+                                            "resid_l": float(left_c),
+                                            "fz_r": float(fz_r),
+                                            "fz_l": float(fz_l),
+                                            "lat_mm": float(feat_after.lateral_m)
+                                            * 1000.0,
+                                            "along_mm": float(feat_after.along_m)
+                                            * 1000.0,
+                                            "f_des": float(f_reseat),
+                                            "priv_peg_tray_ncon": float(
+                                                getattr(
+                                                    feat_after,
+                                                    "priv_peg_tray_ncon",
+                                                    0.0,
+                                                )
+                                                or 0.0
+                                            ),
+                                        }
+                                    )
+                                    t_force += 1
+                                    steps += 1
+                            # Re-plan spiral AFTER outward so waypoints start at the
+                            # enlarged tip radius (old plan was built pre-outward).
+                            if search_mode == "planned_spiral":
+                                feat_sp0 = features_from_raw(raw)
+                                tip_sp0 = np.asarray(
+                                    feat_sp0.tip_pos, dtype=np.float64
+                                ).reshape(3)
+                                along0_spiral = float(feat_sp0.along_m)
+                                surface_depth0 = float(np.dot(tip_sp0, spiral_n))
+                                along_hold_m = surface_depth0
+                                tip_prev_stuck = tip_sp0.copy()
+                                lat_guess = max(
+                                    float(feat_sp0.lateral_m),
+                                    float(
+                                        np.linalg.norm(
+                                            _tip_lat_offset_xy(
+                                                tip_sp0,
+                                                _hole_axis_point_at_tip(
+                                                    tip_sp0,
+                                                    feat_sp0.socket_pos,
+                                                    feat_sp0.hole_axis,
+                                                ),
+                                                spiral_n,
+                                            )
+                                        )
+                                    ),
+                                )
+                                need = int(
+                                    max(
+                                        240,
+                                        (lat_guess - mouth_lat)
+                                        / max(pitch, 1e-6)
+                                        * (2.0 * np.pi)
+                                        / max(dtheta, 1e-4)
+                                        + 80,
+                                    )
+                                )
+                                (
+                                    planned_wps,
+                                    planned_rs,
+                                    planned_ths,
+                                    planned_center,
+                                    _basis,
+                                ) = _plan_surface_enter_spiral(
+                                    tip_sp0,
+                                    feat_sp0.socket_pos,
+                                    feat_sp0.hole_axis,
+                                    spiral_n,
+                                    pitch_m=pitch,
+                                    dtheta=dtheta,
+                                    r_min_m=max(r_min, mouth_lat),
+                                    n_max=max(n_search, need),
+                                )
+                                spiral_center = planned_center
+                                spiral_center_mode = "planned_hole"
+                                n_wp = int(planned_wps.shape[0])
+                                n_search = n_wp
+                                if tip_gate:
+                                    fpp = int(
+                                        a_cfg.get(
+                                            "surface_planned_tip_gate_frames_per_wp",
+                                            8,
+                                        )
+                                    )
+                                    n_search = max(n_wp, n_wp * max(1, fpp))
+                                t1 = _basis[0]
+                                t2 = _basis[1]
+                                print(
+                                    f"pci: planned-spiral REPLAN after outward "
+                                    f"N_wp={n_wp} n_frames={n_search} "
+                                    f"r0={float(planned_rs[0])*1e3:.1f}mm "
+                                    f"rN={float(planned_rs[-1])*1e3:.1f}mm "
+                                    f"lat={lat_guess*1e3:.1f}mm",
+                                    flush=True,
+                                )
                         if pre_lat_n > 0:
                             for pre_lat_used in range(1, pre_lat_n + 1):
                                 feat_i = features_from_raw(raw)
@@ -5645,6 +5993,95 @@ def run_pbvs_biased_surface_press(
                                     lis_ax0 = max(lat0_lis, r_start, lis_amin)
                                 if lis_ay0 <= 0.0:
                                     lis_ay0 = lis_ax0 * lis_ay_ratio
+                        # Pre-spiral SEAT gate (hard): no float search.
+                        # Press-only until wrist residual seats, then start spiral.
+                        if (
+                            search_mode == "planned_spiral"
+                            and bool(
+                                a_cfg.get("surface_pre_spiral_seat_enable", True)
+                            )
+                        ):
+                            pre_n = int(
+                                a_cfg.get("surface_pre_spiral_seat_frames", 180)
+                            )
+                            pre_f = float(
+                                a_cfg.get(
+                                    "surface_pre_spiral_seat_f_des_n",
+                                    max(float(f_des), 0.12),
+                                )
+                            )
+                            pre_hold = int(
+                                a_cfg.get("surface_pre_spiral_seat_hold_frames", 12)
+                            )
+                            seat_ok_streak = 0
+                            print(
+                                f"pci: pre-spiral SEAT frames≤{pre_n} "
+                                f"f_des={pre_f:.2f}N (planar frozen)",
+                                flush=True,
+                            )
+                            for _ps in range(max(0, pre_n)):
+                                site_now = actual_action44_from_sites(raw)
+                                contact, left_c, fz_r, fz_l = _wrist_contact()
+                                if float(contact) >= seat_contact_n:
+                                    seat_ok_streak += 1
+                                    if seat_ok_streak >= pre_hold:
+                                        print(
+                                            f"pci: pre-spiral SEAT OK j={_ps} "
+                                            f"|r|={contact:.2f}N",
+                                            flush=True,
+                                        )
+                                        break
+                                else:
+                                    seat_ok_streak = 0
+                                err_f = pre_f - float(contact)
+                                ax_step = float(
+                                    np.clip(kp * err_f, -max_step, max_step)
+                                )
+                                if err_f > 0.0:
+                                    ax_step = max(ax_step, 5e-5)
+                                cmd = np.zeros(44, dtype=np.float64)
+                                cmd[0:6] = site_now[0:6].copy()
+                                cmd[0:3] = site_now[0:3] + press_ax_spiral * ax_step
+                                _fill_tip_search_hands(cmd)
+                                cmd[22:28] = site_now[22:28].copy()
+                                step_action44(
+                                    gym_env, cmd, ego_recorder=ego_recorder
+                                )
+                                feat_ps = features_from_raw(raw)
+                                force_trace.append(
+                                    {
+                                        "t": float(t_force) * dt_f,
+                                        "step": float(t_force),
+                                        "phase": "pre_spiral_seat",
+                                        "resid_r": float(contact),
+                                        "resid_l": float(left_c),
+                                        "fz_r": float(fz_r),
+                                        "fz_l": float(fz_l),
+                                        "lat_mm": float(feat_ps.lateral_m) * 1000.0,
+                                        "along_mm": float(feat_ps.along_m)
+                                        * 1000.0,
+                                        "f_des": float(pre_f),
+                                    }
+                                )
+                                t_force += 1
+                                steps += 1
+                            else:
+                                print(
+                                    f"pci: pre-spiral SEAT timeout |r|="
+                                    f"{_wrist_contact()[0]:.2f}N "
+                                    f"(spiral may float-reject)",
+                                    flush=True,
+                                )
+                            feat_sp0 = features_from_raw(raw)
+                            tip_sp0 = np.asarray(
+                                feat_sp0.tip_pos, dtype=np.float64
+                            ).reshape(3)
+                            along0_spiral = float(feat_sp0.along_m)
+                            surface_depth0 = float(np.dot(tip_sp0, spiral_n))
+                            along_hold_m = surface_depth0
+                            tip_prev_stuck = tip_sp0.copy()
+                            meta["pre_spiral_seat"] = True
+                            meta["pre_spiral_along0_mm"] = float(along0_spiral) * 1000.0
                         used_sp = 0
                         r_cmd = 0.0
                         _bl_meta: dict = {}
@@ -5859,10 +6296,17 @@ def run_pbvs_biased_surface_press(
                                     )
                                 )
                             contact_gate_sp = 0.0
+                            unseated_sp = False
                             if (
                                 search_mode == "planned_spiral" and stick_phase == "search"
                             ) or franka_faithful:
                                 contact_gate_sp, _, _, _ = _wrist_contact()
+                                # Hard seat: no radius shrink / planar search while
+                                # wrist residual shows tip off tray (float search ban).
+                                unseated_sp = bool(
+                                    require_seat_search
+                                    and float(contact_gate_sp) < seat_contact_n
+                                )
                                 # Tilted tray/hole face: refresh contact normal from
                                 # wrist force so planar track stays on the surface.
                                 if search_mode == "planned_spiral" and bool(
@@ -6161,6 +6605,8 @@ def run_pbvs_biased_surface_press(
                                 hyb_allow_adv = (not tip_hybrid_enable) or (
                                     tip_hybrid_state.mode == "spiral"
                                 )
+                                if unseated_sp:
+                                    hyb_allow_adv = False
                                 # Tip-MSAR Type B: freeze radius while reseating after slip.
                                 if tip_msar_enable and int(
                                     tip_hybrid_state.slip_reseat_left
@@ -8609,6 +9055,18 @@ def run_pbvs_biased_surface_press(
                                         overloaded = True
                                     if force_seat_sp or overloaded:
                                         planar_scale = 0.0
+                                    if unseated_sp:
+                                        # Float ban: zero planar, press to reseat.
+                                        planar_scale = 0.0
+                                        ax_step = max(
+                                            float(ax_step),
+                                            float(
+                                                a_cfg.get(
+                                                    "surface_planned_surface_reseat_m",
+                                                    0.00012,
+                                                )
+                                            ),
+                                        )
                                     if force_seat_sp and not overloaded:
                                         f_tol = float(
                                             a_cfg.get(
@@ -9463,6 +9921,8 @@ def run_pbvs_biased_surface_press(
                             spiral_contact_frames += 1
                             if float(contact_sp) >= seat_contact_n:
                                 spiral_contact_ok_n += 1
+                                if spiral_contact_frames <= spiral_early_frames_n:
+                                    spiral_early_contact_ok_n += 1
                             out_i = env._labeler.compute(raw)
                             if _grasp_lost():
                                 # Planned spiral: tip-tracking mode expects peel;
@@ -10595,6 +11055,16 @@ def run_pbvs_biased_surface_press(
                         meta["spiral_contact_frac"] = float(
                             spiral_contact_ok_n / max(spiral_contact_frames, 1)
                         )
+                        _early_den = max(
+                            1, min(spiral_contact_frames, spiral_early_frames_n)
+                        )
+                        meta["spiral_early_contact_ok_n"] = int(
+                            spiral_early_contact_ok_n
+                        )
+                        meta["spiral_early_contact_frames"] = int(_early_den)
+                        meta["spiral_early_contact_frac"] = float(
+                            spiral_early_contact_ok_n / float(_early_den)
+                        )
                         meta["tip_hybrid_enable"] = bool(tip_hybrid_enable)
                         meta["tip_hybrid_mode_final"] = str(tip_hybrid_state.mode)
                         meta["tip_hybrid_seat_frames"] = int(
@@ -11563,6 +12033,8 @@ def run_pci_episode(
         float_peak_m = float(clean.get("spiral_tip_float_peak_m") or 0.0)
         _cf = clean.get("spiral_contact_frac", None)
         contact_frac = 1.0 if _cf is None else float(_cf)
+        _ecf = clean.get("spiral_early_contact_frac", None)
+        early_contact_frac = contact_frac if _ecf is None else float(_ecf)
         tip_in_bore = tip_now_m <= float(
             a_cfg.get("surface_planned_priv_enter_tip_m", 0.095)
         ) or along_now_m <= float(
@@ -11575,8 +12047,17 @@ def run_pci_episode(
         max_float = float(
             a_cfg.get("surface_planned_priv_enter_max_float_m", 0.004)
         )
+        # Hard seat (2026-09-04): float search is never success.
         min_contact_frac = float(
-            a_cfg.get("surface_planned_priv_enter_min_contact_frac", 0.0)
+            a_cfg.get("surface_planned_priv_enter_min_contact_frac", 0.80)
+        )
+        min_early_contact_frac = float(
+            a_cfg.get(
+                "surface_planned_priv_enter_min_early_contact_frac", 0.85
+            )
+        )
+        min_spiral_frames = int(
+            a_cfg.get("surface_planned_priv_enter_min_spiral_frames", 30)
         )
         max_along = float(
             a_cfg.get("surface_planned_priv_enter_max_along_m", 0.100)
@@ -11587,12 +12068,16 @@ def run_pci_episode(
         axis_ok = axis_err_deg <= max_axis
         # Floating over mouth (lat_min ok but along still high) is not enter.
         along_ok = tip_in_bore or along_now_m <= max_along
-        # Geometry seat: tip plane float + rise. Contact frac is optional
-        # (light seeking force can sit below resid threshold while seated).
+        # Geometry seat + contact seat (hard): reject START_FLOAT / DEGENERATE.
         seat_ok = float_peak_m <= max_float and tip_rise_m <= max_tip_rise
         n_c = int(clean.get("spiral_contact_frames") or 0)
-        if min_contact_frac > 1e-9 and n_c >= 30:
+        degenerate = n_c < min_spiral_frames
+        if degenerate:
+            seat_ok = False
+        if min_contact_frac > 1e-9 and n_c >= min_spiral_frames:
             seat_ok = seat_ok and contact_frac >= min_contact_frac
+        if min_early_contact_frac > 1e-9 and n_c >= min(min_spiral_frames, 20):
+            seat_ok = seat_ok and early_contact_frac >= min_early_contact_frac
         lat_ok = near_mouth_audit or tip_in_bore
         priv_enter_ok = bool(lat_ok and along_ok and axis_ok and seat_ok)
         # Success: force hole + seated tip search + upright enter.
@@ -11604,7 +12089,7 @@ def run_pci_episode(
             f"lat={feat.lateral_m*1e3:.1f}mm along={feat.along_m*1e3:.1f}mm "
             f"tip={feat.tip_socket_dist_m*1e3:.1f}mm "
             f"axis={axis_err_deg:.1f}deg float={float_peak_m*1e3:.1f}mm "
-            f"cfrac={contact_frac:.2f} "
+            f"cfrac={contact_frac:.2f} early={early_contact_frac:.2f} "
             f"force_hole={int(mouth_enter_demo)} priv_audit={int(priv_enter_ok)} "
             f"enter_ok={int(enter_ok)} insert_ok={int(insert_ok_demo)}",
             flush=True,
@@ -11614,6 +12099,8 @@ def run_pci_episode(
             if mouth_enter_demo and not priv_enter_ok:
                 if not axis_ok:
                     fail_reason = "force_hole_axis_reject"
+                elif degenerate:
+                    fail_reason = "force_hole_degenerate_reject"
                 elif not seat_ok:
                     fail_reason = "force_hole_float_reject"
                 elif not along_ok:
