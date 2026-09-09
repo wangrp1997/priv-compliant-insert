@@ -53,6 +53,7 @@ from pci.tip_theory_estimator import (
 )
 from pci.fail_driven_hard_hqp import HardHqpConfig
 from pci.track_b_clep import ClepConfig, ClepState
+from pci.extrinsic_seat import ExtrinsicSeatConfig, resolve_seat
 from pci.track_b_fasr import FasrConfig, FasrState
 from pci.track_a_tec_joint import (
     TecJointConfig,
@@ -5287,6 +5288,148 @@ def run_pbvs_biased_surface_press(
                         along_seat_ref_m = float(feat_sp0.along_m)
                         force_hole_state = SpiralForceHoleDetectState()
                         search_cfg_sp = cfg.get("compliant", {}).get("search", {})
+                        # Dual-track SEAT observation (docs/TRACK_AB_EXTRINSIC_SEAT.md).
+                        seat_obs_mode = str(
+                            a_cfg.get("surface_seat_obs_mode", "auto")
+                        ).strip().lower()
+                        tip_seat_sensor = tip_contact_sensor or tip_est
+                        if tip_seat_sensor is None and seat_obs_mode in (
+                            "tip_contact",
+                            "tec",
+                            "track_a",
+                            "auto",
+                        ):
+                            _enable_tip_seat = bool(
+                                a_cfg.get(
+                                    "surface_seat_tip_contact_enable",
+                                    seat_obs_mode
+                                    in ("tip_contact", "tec", "track_a"),
+                                )
+                            )
+                            if _enable_tip_seat and seat_obs_mode != "extrinsic":
+                                tip_seat_sensor = ContactTipEstimator(
+                                    raw,
+                                    ema=0.55,
+                                    min_force_n=float(
+                                        a_cfg.get(
+                                            "surface_tip_est_min_force_n", 0.008
+                                        )
+                                        or 0.008
+                                    ),
+                                    seat_force_n=float(
+                                        a_cfg.get(
+                                            "surface_tip_est_seat_force_n", 0.015
+                                        )
+                                        or 0.015
+                                    ),
+                                )
+                                meta["seat_tip_contact_sensor"] = True
+                        extrinsic_seat_cfg = ExtrinsicSeatConfig(
+                            f_n_seat=float(
+                                a_cfg.get(
+                                    "surface_seat_extrinsic_fn_n",
+                                    a_cfg.get(
+                                        "surface_tip_hybrid_seat_contact_n", 0.05
+                                    ),
+                                )
+                            ),
+                            require_contact_est=bool(
+                                a_cfg.get(
+                                    "surface_seat_extrinsic_require_clep", True
+                                )
+                            ),
+                        )
+                        meta["seat_obs_mode"] = str(seat_obs_mode)
+
+                        def _seat_verdict_now() -> object:
+                            wr_s = read_wrist_wrench_world(raw)
+                            # Residual along hole (same as |_wrist_contact|), NOT
+                            # absolute wrench — abs |n·F|~6N false-seated AC ep07.
+                            fz_r = float(
+                                wrench_in_hole_frame(wr_s[0], hole_u)[2]
+                            )
+                            fn_resid = float(fz_r) - float(fz_base_c)
+                            f_resid = (
+                                np.asarray(hole_u, dtype=np.float64).reshape(3)
+                                * float(fn_resid)
+                            )
+                            tau_s = np.asarray(wr_s[0][3:6], dtype=np.float64)
+                            site_s = actual_action44_from_sites(raw)[0:3]
+                            tip_n = tip_f = None
+                            mode_s = seat_obs_mode
+                            if tip_seat_sensor is not None and mode_s in (
+                                "tip_contact",
+                                "tec",
+                                "track_a",
+                                "auto",
+                            ):
+                                _c_s, tip_f, tip_n = tip_seat_sensor.measure_peg_tray_tip(
+                                    raw, spiral_n
+                                )
+                                if mode_s == "auto":
+                                    mode_s = "tip_contact"
+                            elif mode_s == "auto":
+                                mode_s = "extrinsic"
+                            return resolve_seat(
+                                mode=mode_s,
+                                force_xyz=f_resid,
+                                torque_xyz=tau_s,
+                                normal=hole_u,
+                                site_xyz=site_s,
+                                tip_anchor=np.asarray(
+                                    feat_sp0.tip_pos, dtype=np.float64
+                                ).reshape(3),
+                                tip_ncon=tip_n,
+                                tip_force_n=tip_f,
+                                tip_seat_force_n=float(
+                                    a_cfg.get(
+                                        "surface_tip_est_seat_force_n", 0.015
+                                    )
+                                    or 0.015
+                                ),
+                                extrinsic_cfg=extrinsic_seat_cfg,
+                            )
+
+                        def _seat_reseat_ax_m(seated: bool) -> float:
+                            """ConnTact seeking into tray while unseated (Pfanne stiffen separate)."""
+                            if seated:
+                                return float(
+                                    a_cfg.get(
+                                        "surface_planned_probe_press_m", 0.00005
+                                    )
+                                )
+                            return float(
+                                a_cfg.get(
+                                    "surface_seat_reseat_step_m",
+                                    max(
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_surface_reseat_m",
+                                                0.00012,
+                                            )
+                                        ),
+                                        float(
+                                            a_cfg.get(
+                                                "surface_planned_seek_step_m",
+                                                0.00012,
+                                            )
+                                        ),
+                                    ),
+                                )
+                            )
+
+                        def _seat_stiffen_right_hand(cmd44: np.ndarray) -> None:
+                            """Pfanne-style grasp stiffen while reseating (tip follows wrist)."""
+                            scale = float(
+                                a_cfg.get("surface_seat_reseat_grasp_scale", 1.35)
+                            )
+                            if scale <= 1.0 + 1e-9:
+                                return
+                            h = np.asarray(cmd44[6:22], dtype=np.float64)
+                            cmd44[6:22] = np.clip(
+                                np.maximum(h, h * scale), -1.5, 1.5
+                            )
+
                         priv_overforce_streak = 0
                         priv_overforce_streak_peak = 0
                         priv_along_drift_peak_m = 0.0
@@ -5343,21 +5486,37 @@ def run_pbvs_biased_surface_press(
                                     break
                                 d_ap = err_ap * min(1.0, approach_step / en_ap)
                                 contact_ap = float(_wrist_contact()[0])
-                                # Always reseat while approaching — ep03/07 floated
-                                # at along~140mm with grasp residual, not tray seat.
-                                if contact_ap < 0.05 or float(
-                                    feat_ap.tip_socket_dist_m
-                                ) > 0.115:
-                                    ax_ap = press_ax_spiral * max(
-                                        approach_press * 2.5, 0.0002
-                                    )
+                                # SEAT ≻ planar (Raibert/ConnTact): no lat shrink while
+                                # tip–tray seat observation is false (ban float approach).
+                                seat_ap = _seat_verdict_now()
+                                seated_ap = bool(getattr(seat_ap, "seated", False))
+                                if not seated_ap:
+                                    d_ap = d_ap * 0.0
+                                # ConnTact seeking into tray + Pfanne grasp stiffen while
+                                # unseated (tip_contact=0 / residual low). Use -hole_u.
+                                ax_mag = _seat_reseat_ax_m(seated_ap)
+                                if (
+                                    (not seated_ap)
+                                    or contact_ap < 0.05
+                                    or float(feat_ap.tip_socket_dist_m) > 0.115
+                                ):
+                                    ax_mag = max(ax_mag, approach_press * 2.5, 0.0002)
                                 else:
-                                    ax_ap = press_ax_spiral * approach_press
+                                    ax_mag = max(ax_mag, approach_press)
+                                # Pfanne: first frames grasp-stiffen only (no axial peel).
+                                grasp_only_n = int(
+                                    a_cfg.get("surface_seat_grasp_only_frames", 40)
+                                )
+                                if (not seated_ap) and ap_used < grasp_only_n:
+                                    ax_mag = 0.0
+                                ax_ap = (-hole_u) * float(ax_mag)
                                 site_ap = actual_action44_from_sites(raw)
                                 cmd_ap = np.zeros(44, dtype=np.float64)
                                 cmd_ap[0:6] = site_ap[0:6].copy()
                                 cmd_ap[0:3] = site_ap[0:3] + d_ap + ax_ap
                                 _fill_tip_search_hands(cmd_ap)
+                                if not seated_ap:
+                                    _seat_stiffen_right_hand(cmd_ap)
                                 cmd_ap[22:28] = site_ap[22:28].copy()
                                 step_action44(
                                     gym_env, cmd_ap, ego_recorder=ego_recorder
@@ -5370,7 +5529,10 @@ def run_pbvs_biased_surface_press(
                                         f"pci: surface-approach j={ap_used} "
                                         f"lat={feat_ap.lateral_m*1e3:.1f}mm "
                                         f"along={feat_ap.along_m*1e3:.1f}mm "
-                                        f"|r|={_wrist_contact()[0]:.2f}N",
+                                        f"|r|={_wrist_contact()[0]:.2f}N "
+                                        f"seat={getattr(seat_ap, 'source', '?')}:"
+                                        f"{int(seated_ap)} "
+                                        f"fn={getattr(seat_ap, 'fn_n', 0):.3f}",
                                         flush=True,
                                     )
                             if ap_used > 0:
@@ -6016,33 +6178,51 @@ def run_pbvs_biased_surface_press(
                             seat_ok_streak = 0
                             print(
                                 f"pci: pre-spiral SEAT frames≤{pre_n} "
-                                f"f_des={pre_f:.2f}N (planar frozen)",
+                                f"f_des={pre_f:.2f}N mode={seat_obs_mode} "
+                                f"(planar frozen)",
                                 flush=True,
                             )
                             for _ps in range(max(0, pre_n)):
                                 site_now = actual_action44_from_sites(raw)
                                 contact, left_c, fz_r, fz_l = _wrist_contact()
-                                if float(contact) >= seat_contact_n:
+                                seat_v = _seat_verdict_now()
+                                seated_ps = bool(getattr(seat_v, "seated", False))
+                                if seated_ps:
                                     seat_ok_streak += 1
                                     if seat_ok_streak >= pre_hold:
                                         print(
                                             f"pci: pre-spiral SEAT OK j={_ps} "
-                                            f"|r|={contact:.2f}N",
+                                            f"|r|={contact:.2f}N "
+                                            f"src={getattr(seat_v, 'source', '?')} "
+                                            f"fn={getattr(seat_v, 'fn_n', 0):.3f} "
+                                            f"ncon={getattr(seat_v, 'tip_contact_n', 0)}",
                                             flush=True,
                                         )
                                         break
                                 else:
                                     seat_ok_streak = 0
-                                err_f = pre_f - float(contact)
-                                ax_step = float(
-                                    np.clip(kp * err_f, -max_step, max_step)
+                                # Unseated: Pfanne stiffen; axial only after grasp-only window.
+                                # Wrist |r|→f_des chase is wrong (grasp resid ≠ tray).
+                                grasp_only_n = int(
+                                    a_cfg.get("surface_seat_grasp_only_frames", 40)
                                 )
-                                if err_f > 0.0:
-                                    ax_step = max(ax_step, 5e-5)
+                                if (not seated_ps) and _ps < grasp_only_n:
+                                    ax_step = 0.0
+                                else:
+                                    ax_step = _seat_reseat_ax_m(seated_ps)
+                                    if not seated_ps:
+                                        ax_step = max(ax_step, 1.2e-4)
+                                    else:
+                                        err_f = pre_f - float(contact)
+                                        ax_step = float(
+                                            np.clip(kp * err_f, -max_step, max_step)
+                                        )
                                 cmd = np.zeros(44, dtype=np.float64)
                                 cmd[0:6] = site_now[0:6].copy()
-                                cmd[0:3] = site_now[0:3] + press_ax_spiral * ax_step
+                                cmd[0:3] = site_now[0:3] + (-hole_u) * float(ax_step)
                                 _fill_tip_search_hands(cmd)
+                                if not seated_ps:
+                                    _seat_stiffen_right_hand(cmd)
                                 cmd[22:28] = site_now[22:28].copy()
                                 step_action44(
                                     gym_env, cmd, ego_recorder=ego_recorder
@@ -6061,14 +6241,25 @@ def run_pbvs_biased_surface_press(
                                         "along_mm": float(feat_ps.along_m)
                                         * 1000.0,
                                         "f_des": float(pre_f),
+                                        "seat_src": str(
+                                            getattr(seat_v, "source", "")
+                                        ),
+                                        "seat_ok": int(
+                                            bool(getattr(seat_v, "seated", False))
+                                        ),
+                                        "priv_peg_tray_ncon": float(
+                                            getattr(seat_v, "tip_contact_n", 0) or 0
+                                        ),
                                     }
                                 )
                                 t_force += 1
                                 steps += 1
                             else:
+                                seat_v = _seat_verdict_now()
                                 print(
                                     f"pci: pre-spiral SEAT timeout |r|="
                                     f"{_wrist_contact()[0]:.2f}N "
+                                    f"src={getattr(seat_v, 'source', '?')} "
                                     f"(spiral may float-reject)",
                                     flush=True,
                                 )
@@ -6301,12 +6492,17 @@ def run_pbvs_biased_surface_press(
                                 search_mode == "planned_spiral" and stick_phase == "search"
                             ) or franka_faithful:
                                 contact_gate_sp, _, _, _ = _wrist_contact()
-                                # Hard seat: no radius shrink / planar search while
-                                # wrist residual shows tip off tray (float search ban).
-                                unseated_sp = bool(
-                                    require_seat_search
-                                    and float(contact_gate_sp) < seat_contact_n
-                                )
+                                # Hard seat: freeze planar while tip–tray seat obs false
+                                # (wrist |r| alone is not tray seat under non-rigid grasp).
+                                if require_seat_search:
+                                    _sv = _seat_verdict_now()
+                                    unseated_sp = not bool(
+                                        getattr(_sv, "seated", False)
+                                    )
+                                else:
+                                    unseated_sp = bool(
+                                        float(contact_gate_sp) < seat_contact_n
+                                    )
                                 # Tilted tray/hole face: refresh contact normal from
                                 # wrist force so planar track stays on the surface.
                                 if search_mode == "planned_spiral" and bool(
@@ -9056,16 +9252,11 @@ def run_pbvs_biased_surface_press(
                                     if force_seat_sp or overloaded:
                                         planar_scale = 0.0
                                     if unseated_sp:
-                                        # Float ban: zero planar, press to reseat.
+                                        # Float ban: zero planar, ConnTact press + grasp stiffen.
                                         planar_scale = 0.0
                                         ax_step = max(
                                             float(ax_step),
-                                            float(
-                                                a_cfg.get(
-                                                    "surface_planned_surface_reseat_m",
-                                                    0.00012,
-                                                )
-                                            ),
+                                            float(_seat_reseat_ax_m(False)),
                                         )
                                     if force_seat_sp and not overloaded:
                                         f_tol = float(
@@ -9608,6 +9799,8 @@ def run_pbvs_biased_surface_press(
                                     R.from_rotvec(tip_hybrid_omega) * R_cur
                                 ).as_rotvec()
                             _fill_tip_search_hands(cmd)
+                            if unseated_sp:
+                                _seat_stiffen_right_hand(cmd)
                             cmd[22:28] = hold_l
                             step_action44(gym_env, cmd, ego_recorder=ego_recorder)
                             feat_after_sp = features_from_raw(raw)

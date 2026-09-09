@@ -450,6 +450,14 @@ approach:
   surface_pre_spiral_seat_enable: true
   surface_spiral_require_seat: true
   surface_path_reverse_reseat_enable: true
+  surface_seat_obs_mode: extrinsic
+  surface_seat_tip_contact_enable: false
+  surface_seat_extrinsic_fn_n: 0.05
+  surface_seat_extrinsic_require_clep: true
+  surface_seat_reseat_grasp_scale: 1.55
+  surface_seat_reseat_step_m: 0.00012
+  surface_seat_grasp_only_frames: 60
+  surface_pre_spiral_seat_frames: 360
   surface_planned_seat_contact_n: 0.08
 
   surface_planned_approach_lat_m: 0.016

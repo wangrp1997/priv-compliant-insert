@@ -14,7 +14,7 @@
 
 ## Smoke（进行中）
 
-- Track-B: `outputs/scheme_l3/seat_hard_smoke_B_ac_ep07/`
-- Track-A/Type-A: `outputs/scheme_l3/seat_hard_smoke_A_typeA_ep02/`
+- Track-B: `outputs/scheme_l3/seat_ext_smoke_B_ac_ep07/`（extrinsic `|n·F|`+CLEP）
+- Track-A/Type-A: `outputs/scheme_l3/seat_ext_smoke_A_typeA_ep02/`（tip_contact）
 
-过 early/cfrac 后再扩 ep1–10；旧论文 7/10 不得当贴面成功率。
+见 `docs/TRACK_AB_EXTRINSIC_SEAT.md`。过 early/cfrac 后再扩 ep1–10。

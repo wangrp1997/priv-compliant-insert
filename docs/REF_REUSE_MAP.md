@@ -24,7 +24,7 @@ Self-implemented modules below were checked against `refs/`; no runtime dependen
 | `tip_theory_estimator` + `track_a_gmhqp_tip_fuse` | TEC PoseDiff/DispDiff + TacGraph in-hand prior + GMHQP | cite | Wave-6 **reuse**: soft geom tip meas in TEC-slim; stop ˆt free-run (`docs/TRACK_A_GMHQP_TIP_FUSE.md`) |
 | `track_a_tec_joint_gmhqp` (wave-7) | Kim TEC ICRA 2023 joint est–ctrl + GMHQP | cite | NIS/contact-gated \(\hat t\) into tip task (`docs/TRACK_A_TEC_JOINT_ON_GMHQP.md`) |
 | `track_b_gmhqp_compc` (wave-7) | Active Extrinsic \(e_c\) + LeTac-MPC-style short-horizon \(J\) on GMHQP | cite | Contact residual in cost, not tip_obj swap (`docs/TRACK_B_CONTACT_OPT_ON_GMHQP.md`) |
-| `src/pci/tip_factor_graph.py` | `refs/Tactile-Estimator-Controller` FACTORS.md + Kim TEC ICRA 2023 | cite | Track-A **fuller** factor-graph skeleton (ContactMotion/Wrench/Torq/Energy/Pen*); orthogonal to gated TEC-slim EKF (`docs/TRACK_A_FACTOR_GRAPH_TIP.md`) |
+| `src/pci/extrinsic_seat.py` | Kim TEC contact; Active Extrinsic / Doshi / CLEP | cite | Dual-track SEAT obs: tip_contact (A) vs `|n·F|`+CLEP (B); freeze planar while unseated |
 
 ## Adapt (concept + simplified sim substitute)
 
